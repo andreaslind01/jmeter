@@ -175,7 +175,13 @@ public class JSONPathAssertion extends AbstractTestElement implements Serializab
             }
         } else {
             Object expected = JSONValue.parse(getExpectedValue());
-            return Objects.equals(expected, subj);
+            if (Objects.equals(expected, subj)) {
+                return true;
+            } else {
+                log.warn("Fallback auf das Verhalten von JMeter 5.4.x: {} ({} = {})",
+                        getName(), getJsonPath(), getExpectedValue());
+                return objectToString(subj).equals(getExpectedValue());
+            }
         }
     }
 
