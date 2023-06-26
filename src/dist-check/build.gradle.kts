@@ -21,16 +21,19 @@ import org.apache.jmeter.buildtools.batchtest.BatchTestServer
 import java.time.Duration
 
 plugins {
-    jmeterbuild.batchtest
+    id("java-test-fixtures")
+    id("build-logic.batchtest")
     id("com.github.vlsi.gradle-extensions")
+    id("build-logic.jvm-library")
 }
 
 val extraTestDependencies by configurations.creating
 val loggingClasspath by configurations.creating
 
 dependencies {
-    api(project(":src:dist"))
-    testImplementation(project(":src:dist", "allTestClasses"))
+    api(projects.src.dist)
+
+    testImplementation(testFixtures(projects.src.core))
     testImplementation("org.apache.commons:commons-lang3") {
         because("StringUtils")
     }
@@ -41,8 +44,9 @@ dependencies {
         because("It is used in ReportGeneratorSpec and HtmlReportGeneratorSpec")
     }
 
-    extraTestDependencies(platform(project(":src:bom")))
-    extraTestDependencies("org.hsqldb:hsqldb")
+    extraTestDependencies(platform(projects.src.bomThirdparty))
+    extraTestDependencies(platform(projects.src.bomTesting))
+    extraTestDependencies("org.hsqldb:hsqldb::jdk8")
     extraTestDependencies("org.apache.mina:mina-core")
     extraTestDependencies("org.apache.ftpserver:ftplet-api")
     extraTestDependencies("org.apache.ftpserver:ftpserver-core")
@@ -60,7 +64,7 @@ dependencies {
     // This is not required for regular ./bin/jmeter because activemq/mina is not on the top-level
     // classpath but all the jars are loaded by a custom classloader which is instantiated by NewDriver
     // TODO: implement "extra classpath folder" in DynamicClassLoader
-    loggingClasspath(platform(project(":src:bom")))
+    loggingClasspath(platform(projects.src.bomThirdparty))
     loggingClasspath("org.slf4j:jcl-over-slf4j")
     loggingClasspath("org.apache.logging.log4j:log4j-api")
     loggingClasspath("org.apache.logging.log4j:log4j-core")
@@ -90,7 +94,7 @@ libOpt.from(populateLibs)
 // For now lib/opt is hard-coded in some of the JMX files
 val extraTestJarsDir = rootProject.layout.projectDirectory.dir("lib").dir("opt")
 
-val createDist by project(":src:dist").tasks.existing(Task::class)
+val createDist = ":src:dist:createDist"
 
 val copyExtraTestLibs by tasks.registering(Sync::class) {
     dependsOn(createDist)
@@ -119,7 +123,7 @@ inline fun <reified T : BatchTest> createBatchTask(
 ) =
     tasks.register(
         "batch" + (if (T::class == BatchTestServer::class) "Server" else "") +
-            name.capitalize() + suffix.capitalize(),
+            name.replaceFirstChar { it.titlecaseChar() } + suffix.replaceFirstChar { it.titlecaseChar() },
         T::class
     ) {
         group = when {

@@ -69,13 +69,13 @@ public class CsvFileSampleSource extends AbstractSampleSource {
     private static final Logger LOG = LoggerFactory.getLogger(CsvFileSampleSource.class);
 
     /** input csv files to be produced */
-    private File[] inputFiles;
+    private final File[] inputFiles;
 
     /** csv readers corresponding to the input files */
-    private CsvSampleReader[] csvReaders;
+    private final CsvSampleReader[] csvReaders;
 
     /** mock producer to produce samples to its consumers */
-    private PrivateProducer producer;
+    private final PrivateProducer producer;
 
     /**
      * Build a sample source from the specified input file and character
@@ -141,7 +141,7 @@ public class CsvFileSampleSource extends AbstractSampleSource {
     /**
      * Get the current time in milliseconds
      */
-    private long now() {
+    private static long now() {
         return System.currentTimeMillis();
     }
 
@@ -151,7 +151,7 @@ public class CsvFileSampleSource extends AbstractSampleSource {
      *
      * @return A readable string that displays the time provided as milliseconds
      */
-    private String time(long t) {
+    private static String time(long t) {
         return TimeHelper.time(t);
     }
 

@@ -24,8 +24,10 @@ import org.gradle.api.internal.TaskOutputsInternal
 import kotlin.math.absoluteValue
 
 plugins {
+    id("build-logic.build-params")
     id("com.github.vlsi.crlf")
     id("com.github.vlsi.stage-vote-release")
+    id("build-logic.jvm-library")
 }
 
 var jars = arrayOf(
@@ -50,6 +52,10 @@ var jars = arrayOf(
     ":src:protocol:tcp"
 )
 
+// https://github.com/gradle/gradle/pull/16627
+inline fun <reified T : Named> AttributeContainer.attribute(attr: Attribute<T>, value: String) =
+    attribute(attr, objects.named<T>(value))
+
 // isCanBeConsumed = false ==> other modules must not use the configuration as a dependency
 val buildDocs by configurations.creating {
     isCanBeConsumed = false
@@ -59,6 +65,13 @@ val generatorJar by configurations.creating {
 }
 val junitSampleJar by configurations.creating {
     isCanBeConsumed = false
+    isTransitive = false
+    attributes {
+        attribute(Category.CATEGORY_ATTRIBUTE, Category.LIBRARY)
+        attribute(LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, LibraryElements.JAR)
+        attribute(Usage.USAGE_ATTRIBUTE, Usage.JAVA_RUNTIME)
+        attribute(Bundling.BUNDLING_ATTRIBUTE, Bundling.EXTERNAL)
+    }
 }
 val binLicense by configurations.creating {
     isCanBeConsumed = false
@@ -67,25 +80,19 @@ val srcLicense by configurations.creating {
     isCanBeConsumed = false
 }
 
-val allTestClasses by configurations.creating {
-    isCanBeConsumed = true
-    isCanBeResolved = false
-}
-
 // Note: you can inspect final classpath (list of jars in the binary distribution)  via
 // gw dependencies --configuration runtimeClasspath
 dependencies {
     for (p in jars) {
         api(project(p))
-        allTestClasses(project(p, "testClasses"))
     }
 
     binLicense(project(":src:licenses", "binLicense"))
     srcLicense(project(":src:licenses", "srcLicense"))
     generatorJar(project(":src:generator", "archives"))
-    junitSampleJar(project(":src:protocol:junit-sample", "archives"))
+    junitSampleJar(project(":src:protocol:junit-sample"))
 
-    buildDocs(platform(project(":src:bom")))
+    buildDocs(platform(projects.src.bomThirdparty))
     buildDocs("org.apache.velocity:velocity")
     buildDocs("commons-lang:commons-lang")
     buildDocs("org.apache.commons:commons-collections4")
@@ -121,9 +128,9 @@ val populateLibs by tasks.registering {
     doLast {
         val deps = configurations.runtimeClasspath.get().resolvedConfiguration.resolvedArtifacts
         // This ensures project exists, if project is renamed, names should be corrected here as wells
-        val launcherProject = project(":src:launcher").path
-        val bshclientProject = project(":src:bshclient").path
-        val jorphanProject = project(":src:jorphan").path
+        val launcherProject = projects.src.launcher.dependencyProject.path
+        val bshclientProject = projects.src.bshclient.dependencyProject.path
+        val jorphanProject = projects.src.jorphan.dependencyProject.path
         listOf(libs, libsExt, binLibs).forEach {
             it.fileMode = "644".toInt(8)
             it.dirMode = "755".toInt(8)
@@ -158,8 +165,16 @@ val verifyReleaseDependencies by tasks.registering {
     dependsOn(configurations.runtimeClasspath)
     val expectedLibs = file("src/dist/expected_release_jars.csv")
     inputs.file(expectedLibs)
+    inputs.property("updateExpectedJars", updateExpectedJars)
     val actualLibs = File(buildDir, "dist/expected_release_jars.csv")
     outputs.file(actualLibs)
+    val ignoreJarsMismatch = version.toString().endsWith("-SNAPSHOT")
+    if (ignoreJarsMismatch || updateExpectedJars) {
+        // The task does not fail in case of -SNAPSHOT version, so we make the task never UP-TO-DATE
+        // in that case. Otherwise, the task never executes on the second request, even if the user runs with
+        // -PupdateExpectedJars
+        outputs.upToDateWhen { false }
+    }
     doLast {
         val caseInsensitive: Comparator<String> = compareBy(String.CASE_INSENSITIVE_ORDER, { it })
 
@@ -202,7 +217,7 @@ val verifyReleaseDependencies by tasks.registering {
             sb.append("\n  ${expected.size} => ${libs.size} files")
             sb.append(" (${if (libs.size > expected.size) "+" else "-"}${(libs.size - expected.size).absoluteValue})")
         }
-        sb.appendln()
+        sb.appendLine()
         for (dep in (libs.keys + expected.keys).sortedWith(caseInsensitive)) {
             val old = expected[dep]
             val new = libs[dep]
@@ -224,6 +239,10 @@ val verifyReleaseDependencies by tasks.registering {
         if (updateExpectedJars) {
             println("Updating ${expectedLibs.relativeTo(rootDir)}")
             actualLibs.copyTo(expectedLibs, overwrite = true)
+        } else if (ignoreJarsMismatch) {
+            // Renovate requires self-hosted runner for executing postUpgradeTasks,
+            // so we can't make Renovate to update expected_release_jars.csv at the moment
+            logger.lifecycle(sb.toString())
         } else {
             throw GradleException(sb.toString())
         }
@@ -270,6 +289,9 @@ val copyBinLibs by tasks.registering(Copy::class) {
     // Can't use $rootDir since Gradle somehow reports .gradle/caches/ as "always modified"
     rootSpec.into("$rootDir/bin")
     with(binLibs)
+    // :src:config:jar conflicts with copyBinLibs on bin, bin/templates, bin/report-template folders
+    // so we add explicit ordering
+    mustRunAfter(":src:config:jar")
 }
 
 val createDist by tasks.registering {
@@ -320,9 +342,9 @@ fun createAnakiaTask(
                 parentFile.run { isDirectory || mkdirs() } || throw IllegalStateException("Unable to create directory $parentFile")
 
                 writer().use {
-                    it.appendln("# Auto-generated from $velocityProperties to pass absolute path to Velocity")
+                    it.appendLine("# Auto-generated from $velocityProperties to pass absolute path to Velocity")
                     for (line in lines) {
-                        it.appendln(line)
+                        it.appendLine(line)
                     }
                 }
             }
@@ -330,16 +352,17 @@ fun createAnakiaTask(
     }
 
     return tasks.register(taskName) {
-        inputs.file("$baseDir/$style")
-        inputs.file("$baseDir/$projectFile")
+        inputs.file("$baseDir/$style").withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("styleDir")
+        inputs.file("$baseDir/$projectFile").withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("projectDir")
         inputs.files(
             fileTree(baseDir) {
                 include(*includes)
                 exclude(*excludes)
             }
-        )
+        ).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("baseDir")
         inputs.property("extension", extension)
         outputs.dir(outputDir)
+        outputs.cacheIf { true }
         dependsOn(prepareProps)
 
         doLast {
@@ -439,9 +462,10 @@ fun xslt(
 
 val processSiteXslt by tasks.registering {
     val outputDir = "$buildDir/siteXslt"
-    inputs.files(xdocs)
+    inputs.files(xdocs).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("xdocs")
     inputs.property("year", lastEditYear)
     outputs.dir(outputDir)
+    outputs.cacheIf { true }
 
     doLast {
         for (f in (outputs as TaskOutputsInternal).previousOutputFiles) {
@@ -473,6 +497,9 @@ val previewSite by tasks.registering(Sync::class) {
     CrLfSpec().run {
         gitattributes(gitProps)
         siteLayout()
+    }
+    doLast {
+        println("Site preview synchronized to $previewSiteDir/index.html")
     }
 }
 
@@ -552,16 +579,14 @@ val javadocAggregate by tasks.registering(Javadoc::class) {
     setDestinationDir(file("$buildDir/docs/javadocAggregate"))
 }
 
-val skipDist: Boolean by rootProject.extra
-
 // Generates distZip, distTar, distZipSource, and distTarSource tasks
 // The archives and checksums are put to build/distributions
 for (type in listOf("binary", "source")) {
-    if (skipDist) {
+    if (buildParameters.skipDist) {
         break
     }
     for (archive in listOf(Zip::class, Tar::class)) {
-        val taskName = "dist${archive.simpleName}${type.replace("binary", "").capitalize()}"
+        val taskName = "dist${archive.simpleName}${type.replace("binary", "").replaceFirstChar { it.titlecaseChar() }}"
         val archiveTask = tasks.register(taskName, archive) {
             val eol = if (archive == Tar::class) LineEndings.LF else LineEndings.CRLF
             group = distributionGroup
@@ -573,6 +598,7 @@ for (type in listOf("binary", "source")) {
             // So we add an artificial dependency
             mustRunAfter(copyBinLibs)
             mustRunAfter(copyLibs)
+            mustRunAfter(":src:dist-check:copyExtraTestLibs")
             // Gradle does not track "filters" as archive/copy task dependencies,
             // So a mere change of a file attribute won't trigger re-execution of a task
             // So we add a custom property to re-execute the task in case attributes change
@@ -606,9 +632,12 @@ val runGui by tasks.registering(JavaExec::class) {
     group = "Development"
     description = "Builds and starts JMeter GUI"
     dependsOn(createDist)
+    buildParameters.testJdk?.let {
+        javaLauncher.set(javaToolchains.launcherFor(it))
+    }
 
     workingDir = File(project.rootDir, "bin")
-    main = "org.apache.jmeter.NewDriver"
+    mainClass.set("org.apache.jmeter.NewDriver")
     classpath("$rootDir/bin/ApacheJMeter.jar")
     jvmArgs("-Xss256k")
     jvmArgs("-XX:MaxMetaspaceSize=256m")

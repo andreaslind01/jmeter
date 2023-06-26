@@ -39,6 +39,8 @@ import org.apache.oro.text.regex.Perl5Compiler;
 import org.apache.oro.text.regex.Util;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.google.auto.service.AutoService;
 /**
  * Implements regular expression parsing of sample results and variables
  * @since 1.X
@@ -46,6 +48,7 @@ import org.slf4j.LoggerFactory;
 
 // @see TestRegexFunction for unit tests
 
+@AutoService(Function.class)
 public class RegexFunction extends AbstractFunction {
     private static final Logger log = LoggerFactory.getLogger(RegexFunction.class);
 
@@ -290,13 +293,13 @@ public class RegexFunction extends AbstractFunction {
         }
     }
 
-    private void saveGroups(java.util.regex.MatchResult result, String namep, JMeterVariables vars) {
+    private static void saveGroups(java.util.regex.MatchResult result, String namep, JMeterVariables vars) {
         for (int x = 0; x <= result.groupCount(); x++) {
             vars.put(namep + "_g" + x, result.group(x)); //$NON-NLS-1$
         }
     }
 
-    private void saveGroups(MatchResult result, String namep, JMeterVariables vars) {
+    private static void saveGroups(MatchResult result, String namep, JMeterVariables vars) {
         for (int x = 0; x < result.groups(); x++) {
             vars.put(namep + "_g" + x, result.group(x)); //$NON-NLS-1$
         }
@@ -308,7 +311,7 @@ public class RegexFunction extends AbstractFunction {
         return desc;
     }
 
-    private String generateResult(MatchResult match, String namep, Object[] template, JMeterVariables vars) {
+    private static String generateResult(MatchResult match, String namep, Object[] template, JMeterVariables vars) {
         saveGroups(match, namep, vars);
         StringBuilder result = new StringBuilder();
         for (Object t : template) {
@@ -324,8 +327,8 @@ public class RegexFunction extends AbstractFunction {
         return result.toString();
     }
 
-    private String generateResult(java.util.regex.MatchResult match, String namep, Object[] template,
-                                  JMeterVariables vars) {
+    private static String generateResult(java.util.regex.MatchResult match, String namep, Object[] template,
+            JMeterVariables vars) {
         saveGroups(match, namep, vars);
         StringBuilder result = new StringBuilder();
         for (Object t : template) {
@@ -361,7 +364,7 @@ public class RegexFunction extends AbstractFunction {
         return generateTemplateWithOroRegex(rawTemplate);
     }
 
-    private Object[] generateTemplateWithJavaRegex(String rawTemplate) {
+    private static Object[] generateTemplateWithJavaRegex(String rawTemplate) {
         // String or Integer
         List<Object> pieces = new ArrayList<>();
         Matcher matcher = templatePatternJava.matcher(rawTemplate);
@@ -411,7 +414,7 @@ public class RegexFunction extends AbstractFunction {
         return combined.toArray();
     }
 
-    private boolean isFirstElementGroup(String rawData) {
+    private static boolean isFirstElementGroup(String rawData) {
         if (USE_JAVA_REGEX) {
             return FIRST_ELEMENT_PATTERN.matcher(rawData).find();
         } else {

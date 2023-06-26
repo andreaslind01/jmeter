@@ -17,17 +17,18 @@
 
 package org.apache.jmeter.protocol.http.sampler;
 
-import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
 import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 
+import org.apache.jmeter.protocol.http.util.ConversionUtils;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
@@ -373,7 +374,7 @@ public class PostWriter {
      *
      * @return the bytes used to end the multipart request
      */
-    private byte[] getMultipartEndDivider(){
+    private static byte[] getMultipartEndDivider(){
         byte[] ending = DASH_DASH_BYTES;
         byte[] completeEnding = new byte[ending.length + CRLF.length];
         System.arraycopy(ending, 0, completeEnding, 0, ending.length);
@@ -385,13 +386,13 @@ public class PostWriter {
      * Write the start of a file multipart, up to the point where the
      * actual file content should be written
      */
-    private void writeStartFileMultipart(OutputStream out, String filename,
+    private static void writeStartFileMultipart(OutputStream out, String filename,
             String nameField, String mimetype)
             throws IOException {
         write(out, "Content-Disposition: form-data; name=\""); // $NON-NLS-1$
         write(out, nameField);
         write(out, "\"; filename=\"");// $NON-NLS-1$
-        write(out, new File(filename).getName());
+        write(out, ConversionUtils.percentEncode(new File(filename).getName()));
         writeln(out, "\""); // $NON-NLS-1$
         writeln(out, "Content-Type: " + mimetype); // $NON-NLS-1$
         writeln(out, "Content-Transfer-Encoding: binary"); // $NON-NLS-1$
@@ -412,7 +413,7 @@ public class PostWriter {
         // uploads were being done. Could be fixed by increasing the evacuation
         // ratio in bin/jmeter[.bat], but this is better.
         int read;
-        try (InputStream in = new BufferedInputStream(new FileInputStream(filename))) {
+        try (InputStream in = Files.newInputStream(Paths.get(filename))) {
             while ((read = in.read(buf)) > 0) {
                 out.write(buf, 0, read);
             }
@@ -437,14 +438,14 @@ public class PostWriter {
         out.write(getMultipartDivider());
     }
 
-    private void write(OutputStream out, String value)
+    private static void write(OutputStream out, String value)
     throws UnsupportedEncodingException, IOException
     {
         out.write(value.getBytes(ENCODING));
     }
 
 
-    private void writeln(OutputStream out, String value)
+    private static void writeln(OutputStream out, String value)
     throws UnsupportedEncodingException, IOException
     {
         out.write(value.getBytes(ENCODING));

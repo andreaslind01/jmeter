@@ -72,7 +72,7 @@ public class HC4CookieHandler implements CookieHandler {
 
     private static final PublicSuffixMatcher publicSuffixMatcher = PublicSuffixMatcherLoader.getDefault();
     @SuppressWarnings("deprecation")
-    private static Registry<CookieSpecProvider> registry  =
+    private static final Registry<CookieSpecProvider> registry  =
             RegistryBuilder.<CookieSpecProvider>create()
             // case is ignored bug registry as it converts to lowerCase(Locale.US)
             .register(CookieSpecs.BEST_MATCH, new DefaultCookieSpecProvider(publicSuffixMatcher))
@@ -241,7 +241,7 @@ public class HC4CookieHandler implements CookieHandler {
      * Create an HttpClient cookie from a JMeter cookie
      */
     @SuppressWarnings("JavaUtilDate")
-    private org.apache.http.cookie.Cookie makeCookie(Cookie jmc) {
+    private static org.apache.http.cookie.Cookie makeCookie(Cookie jmc) {
         long exp = jmc.getExpiresMillis();
         BasicClientCookie ret = new BasicClientCookie(jmc.getName(),
                 jmc.getValue());

@@ -22,6 +22,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.regex.Matcher;
@@ -181,7 +182,7 @@ public class ReportGenerator {
         Matcher matcher = POTENTIAL_CAMEL_CASE_PATTERN.matcher(propertyKey);
         StringBuffer buffer = new StringBuffer(); // NOSONAR Unfortunately Matcher does not support StringBuilder
         while (matcher.find()) {
-            matcher.appendReplacement(buffer, matcher.group(1).toUpperCase());
+            matcher.appendReplacement(buffer, matcher.group(1).toUpperCase(Locale.ROOT));
         }
         matcher.appendTail(buffer);
         return buffer.toString();
@@ -296,7 +297,7 @@ public class ReportGenerator {
         return dateRangeFilter;
     }
 
-    private void removeTempDir(File tmpDir, boolean tmpDirCreated) {
+    private static void removeTempDir(File tmpDir, boolean tmpDirCreated) {
         if (tmpDirCreated) {
             try {
                 FileUtils.deleteDirectory(tmpDir);
@@ -306,7 +307,7 @@ public class ReportGenerator {
         }
     }
 
-    private boolean createTempDir(File tmpDir) throws GenerationException {
+    private static boolean createTempDir(File tmpDir) throws GenerationException {
         if (tmpDir.exists()) {
             return false;
         }
@@ -319,12 +320,12 @@ public class ReportGenerator {
             log.error(message);
             throw new GenerationException(message);
         }
-        return tmpDirCreated;
+        return true;
     }
 
-    private void addGraphConsumer(FilterConsumer nameFilter,
+    private static void addGraphConsumer(FilterConsumer nameFilter,
             FilterConsumer excludeControllerFilter,
-            Map.Entry<String, GraphConfiguration> entryGraphCfg)
+            Map.Entry<String, ? extends GraphConfiguration> entryGraphCfg)
             throws GenerationException {
         String graphName = entryGraphCfg.getKey();
         GraphConfiguration graphConfiguration = entryGraphCfg.getValue();
@@ -389,13 +390,13 @@ public class ReportGenerator {
         }
     }
 
-    private ErrorsSummaryConsumer createErrorsSummaryConsumer() {
+    private static ErrorsSummaryConsumer createErrorsSummaryConsumer() {
         ErrorsSummaryConsumer errorsSummaryConsumer = new ErrorsSummaryConsumer();
         errorsSummaryConsumer.setName(ERRORS_SUMMARY_CONSUMER_NAME);
         return errorsSummaryConsumer;
     }
 
-    private FilterConsumer createExcludeControllerFilter() {
+    private static FilterConsumer createExcludeControllerFilter() {
         FilterConsumer excludeControllerFilter = new FilterConsumer();
         excludeControllerFilter
                 .setName(START_INTERVAL_CONTROLLER_FILTER_CONSUMER_NAME);
@@ -406,7 +407,7 @@ public class ReportGenerator {
         return excludeControllerFilter;
     }
 
-    private SampleConsumer createTop5ErrorsConsumer(ReportGeneratorConfiguration configuration) {
+    private static SampleConsumer createTop5ErrorsConsumer(ReportGeneratorConfiguration configuration) {
         Top5ErrorsBySamplerConsumer top5ErrorsBySamplerConsumer = new Top5ErrorsBySamplerConsumer();
         top5ErrorsBySamplerConsumer.setName(TOP5_ERRORS_BY_SAMPLER_CONSUMER_NAME);
         top5ErrorsBySamplerConsumer.setHasOverallResult(true);
@@ -414,14 +415,14 @@ public class ReportGenerator {
         return top5ErrorsBySamplerConsumer;
     }
 
-    private StatisticsSummaryConsumer createStatisticsSummaryConsumer() {
+    private static StatisticsSummaryConsumer createStatisticsSummaryConsumer() {
         StatisticsSummaryConsumer statisticsSummaryConsumer = new StatisticsSummaryConsumer();
         statisticsSummaryConsumer.setName(STATISTICS_SUMMARY_CONSUMER_NAME);
         statisticsSummaryConsumer.setHasOverallResult(true);
         return statisticsSummaryConsumer;
     }
 
-    private RequestsSummaryConsumer createRequestsSummaryConsumer() {
+    private static RequestsSummaryConsumer createRequestsSummaryConsumer() {
         RequestsSummaryConsumer requestsSummaryConsumer = new RequestsSummaryConsumer();
         requestsSummaryConsumer.setName(REQUESTS_SUMMARY_CONSUMER_NAME);
         return requestsSummaryConsumer;
@@ -459,7 +460,7 @@ public class ReportGenerator {
         return apdexSummaryConsumer;
     }
 
-    private boolean isMatching(String sampleName, String keyName) {
+    private static boolean isMatching(String sampleName, String keyName) {
         if (sampleName == null) {
             return false;
         }
@@ -497,7 +498,7 @@ public class ReportGenerator {
     /**
      * @return Consumer that compute the end date of the test
      */
-    private AggregateConsumer createEndDateConsumer() {
+    private static AggregateConsumer createEndDateConsumer() {
         AggregateConsumer endDateConsumer = new AggregateConsumer(
                 new MaxAggregator(), sample -> (double) sample.getEndTime());
         endDateConsumer.setName(END_DATE_CONSUMER_NAME);
@@ -507,7 +508,7 @@ public class ReportGenerator {
     /**
      * @return Consumer that compute the begining date of the test
      */
-    private AggregateConsumer createBeginDateConsumer() {
+    private static AggregateConsumer createBeginDateConsumer() {
         AggregateConsumer beginDateConsumer = new AggregateConsumer(
                 new MinAggregator(), sample -> (double) sample.getStartTime());
         beginDateConsumer.setName(BEGIN_DATE_CONSUMER_NAME);
@@ -528,7 +529,7 @@ public class ReportGenerator {
      * @throws GenerationException    if conversion of the property value fails or reflection
      *                                throws an InvocationTargetException
      */
-    private void setProperty(String className, Object obj, Method[] methods,
+    private static void setProperty(String className, Object obj, Method[] methods,
             String propertyName, String propertyValue, String setterName)
             throws IllegalAccessException, GenerationException {
         try {

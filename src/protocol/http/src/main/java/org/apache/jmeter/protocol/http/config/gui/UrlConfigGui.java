@@ -32,17 +32,17 @@ import javax.swing.event.ChangeListener;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.jmeter.config.Arguments;
 import org.apache.jmeter.config.ConfigTestElement;
+import org.apache.jmeter.gui.JBooleanPropertyEditor;
 import org.apache.jmeter.gui.util.HorizontalPanel;
 import org.apache.jmeter.gui.util.JSyntaxTextArea;
 import org.apache.jmeter.gui.util.JTextScrollPane;
 import org.apache.jmeter.protocol.http.gui.HTTPArgumentsPanel;
 import org.apache.jmeter.protocol.http.gui.HTTPFileArgsPanel;
 import org.apache.jmeter.protocol.http.sampler.HTTPSamplerBase;
+import org.apache.jmeter.protocol.http.sampler.HTTPSamplerBaseSchema;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
 import org.apache.jmeter.testelement.TestElement;
-import org.apache.jmeter.testelement.property.BooleanProperty;
 import org.apache.jmeter.testelement.property.JMeterProperty;
-import org.apache.jmeter.testelement.property.TestElementProperty;
 import org.apache.jmeter.util.JMeterUtils;
 import org.apache.jorphan.gui.JFactory;
 import org.apache.jorphan.gui.JLabeledChoice;
@@ -90,11 +90,11 @@ public class UrlConfigGui extends JPanel implements ChangeListener {
 
     private JCheckBox autoRedirects;
 
-    private JCheckBox useKeepAlive;
+    private JBooleanPropertyEditor useKeepAlive;
 
-    private JCheckBox useMultipart;
+    private JBooleanPropertyEditor useMultipart;
 
-    private JCheckBox useBrowserCompatibleMultipartMode;
+    private JBooleanPropertyEditor useBrowserCompatibleMultipartMode;
 
     private JLabeledChoice method;
 
@@ -107,8 +107,8 @@ public class UrlConfigGui extends JPanel implements ChangeListener {
     // Tabbed pane that contains parameters and raw body
     private AbstractValidationTabbedPane postContentTabbedPane;
 
-    private boolean showRawBodyPane;
-    private boolean showFileUploadPane;
+    private final boolean showRawBodyPane;
+    private final boolean showFileUploadPane;
 
     /**
      * Constructor which is setup to show HTTP implementation, raw body pane and
@@ -158,9 +158,8 @@ public class UrlConfigGui extends JPanel implements ChangeListener {
             followRedirects.setSelected(getUrlConfigDefaults().isFollowRedirects());
             autoRedirects.setSelected(getUrlConfigDefaults().isAutoRedirects());
             method.setText(getUrlConfigDefaults().getDefaultMethod());
-            useKeepAlive.setSelected(getUrlConfigDefaults().isUseKeepAlive());
-            useMultipart.setSelected(getUrlConfigDefaults().isUseMultipart());
-            useBrowserCompatibleMultipartMode.setSelected(getUrlConfigDefaults().isUseBrowserCompatibleMultipartMode());
+            useKeepAlive.setBooleanValue(getUrlConfigDefaults().isUseKeepAlive());
+            useBrowserCompatibleMultipartMode.setBooleanValue(getUrlConfigDefaults().isUseBrowserCompatibleMultipartMode());
         }
         path.setText(""); // $NON-NLS-1$
         port.setText(""); // $NON-NLS-1$
@@ -214,22 +213,21 @@ public class UrlConfigGui extends JPanel implements ChangeListener {
         if(showFileUploadPane) {
             filesPanel.modifyTestElement(element);
         }
-        element.setProperty(HTTPSamplerBase.POST_BODY_RAW, useRaw, HTTPSamplerBase.POST_BODY_RAW_DEFAULT);
-        element.setProperty(new TestElementProperty(HTTPSamplerBase.ARGUMENTS, args));
-        element.setProperty(HTTPSamplerBase.DOMAIN, domain.getText());
-        element.setProperty(HTTPSamplerBase.PORT, port.getText());
-        element.setProperty(HTTPSamplerBase.PROTOCOL, protocol.getText());
-        element.setProperty(HTTPSamplerBase.CONTENT_ENCODING, contentEncoding.getText());
-        element.setProperty(HTTPSamplerBase.PATH, path.getText());
+        HTTPSamplerBaseSchema.INSTANCE httpSchema = HTTPSamplerBaseSchema.INSTANCE;
+        element.set(httpSchema.getPostBodyRaw(), useRaw);
+        element.set(httpSchema.getArguments(), args);
+        element.set(httpSchema.getDomain(), domain.getText());
+        element.set(httpSchema.getPort(), port.getText());
+        element.set(httpSchema.getProtocol(), protocol.getText());
+        element.set(httpSchema.getContentEncoding(), contentEncoding.getText());
+        element.set(httpSchema.getPath(), path.getText());
         if (notConfigOnly){
-            element.setProperty(HTTPSamplerBase.METHOD, method.getText());
-            element.setProperty(new BooleanProperty(HTTPSamplerBase.FOLLOW_REDIRECTS, followRedirects.isSelected()));
-            element.setProperty(new BooleanProperty(HTTPSamplerBase.AUTO_REDIRECTS, autoRedirects.isSelected()));
-            element.setProperty(new BooleanProperty(HTTPSamplerBase.USE_KEEPALIVE, useKeepAlive.isSelected()));
-            element.setProperty(new BooleanProperty(HTTPSamplerBase.DO_MULTIPART_POST, useMultipart.isSelected()));
-            element.setProperty(HTTPSamplerBase.BROWSER_COMPATIBLE_MULTIPART,
-                    useBrowserCompatibleMultipartMode.isSelected(),
-                    HTTPSamplerBase.BROWSER_COMPATIBLE_MULTIPART_MODE_DEFAULT);
+            element.set(httpSchema.getMethod(), method.getText());
+            element.set(httpSchema.getFollowRedirects(), followRedirects.isSelected());
+            element.set(httpSchema.getAutoRedirects(), autoRedirects.isSelected());
+            useKeepAlive.updateElement(element);
+            useMultipart.updateElement(element);
+            useBrowserCompatibleMultipartMode.updateElement(element);
         }
     }
 
@@ -270,10 +268,11 @@ public class UrlConfigGui extends JPanel implements ChangeListener {
      */
     public void configure(TestElement el) {
         setName(el.getName());
-        Arguments arguments = (Arguments) el.getProperty(HTTPSamplerBase.ARGUMENTS).getObjectValue();
+        HTTPSamplerBaseSchema.INSTANCE httpSchema = HTTPSamplerBaseSchema.INSTANCE;
+        Arguments arguments = el.get(httpSchema.getArguments());
 
         if (showRawBodyPane) {
-            boolean useRaw = el.getPropertyAsBoolean(HTTPSamplerBase.POST_BODY_RAW, HTTPSamplerBase.POST_BODY_RAW_DEFAULT);
+            boolean useRaw = el.get(httpSchema.getPostBodyRaw());
             if(useRaw) {
                 String postBody = computePostBody(arguments, true); // Convert CRLF to CR, see modifyTestElement
                 postBodyContent.setInitialText(postBody);
@@ -291,9 +290,9 @@ public class UrlConfigGui extends JPanel implements ChangeListener {
             filesPanel.configure(el);
         }
 
-        domain.setText(el.getPropertyAsString(HTTPSamplerBase.DOMAIN));
+        domain.setText(el.getString(httpSchema.getDomain()));
 
-        String portString = el.getPropertyAsString(HTTPSamplerBase.PORT);
+        String portString = el.getString(httpSchema.getPort());
 
         // Only display the port number if it is meaningfully specified
         if (portString.equals(HTTPSamplerBase.UNSPECIFIED_PORT_AS_STRING)) {
@@ -301,17 +300,16 @@ public class UrlConfigGui extends JPanel implements ChangeListener {
         } else {
             port.setText(portString);
         }
-        protocol.setText(el.getPropertyAsString(HTTPSamplerBase.PROTOCOL));
-        contentEncoding.setText(el.getPropertyAsString(HTTPSamplerBase.CONTENT_ENCODING));
-        path.setText(el.getPropertyAsString(HTTPSamplerBase.PATH));
+        protocol.setText(el.getString(httpSchema.getProtocol()));
+        contentEncoding.setText(el.getString(httpSchema.getContentEncoding()));
+        path.setText(el.getString(httpSchema.getPath()));
         if (notConfigOnly){
-            method.setText(el.getPropertyAsString(HTTPSamplerBase.METHOD));
-            followRedirects.setSelected(el.getPropertyAsBoolean(HTTPSamplerBase.FOLLOW_REDIRECTS));
-            autoRedirects.setSelected(el.getPropertyAsBoolean(HTTPSamplerBase.AUTO_REDIRECTS));
-            useKeepAlive.setSelected(el.getPropertyAsBoolean(HTTPSamplerBase.USE_KEEPALIVE));
-            useMultipart.setSelected(el.getPropertyAsBoolean(HTTPSamplerBase.DO_MULTIPART_POST));
-            useBrowserCompatibleMultipartMode.setSelected(el.getPropertyAsBoolean(
-                    HTTPSamplerBase.BROWSER_COMPATIBLE_MULTIPART, HTTPSamplerBase.BROWSER_COMPATIBLE_MULTIPART_MODE_DEFAULT));
+            method.setText(el.getString(httpSchema.getMethod()));
+            followRedirects.setSelected(el.get(httpSchema.getFollowRedirects()));
+            autoRedirects.setSelected(el.get(httpSchema.getAutoRedirects()));
+            useKeepAlive.updateUi(el);
+            useMultipart.updateUi(el);
+            useBrowserCompatibleMultipartMode.updateUi(el);
         }
     }
 
@@ -391,19 +389,25 @@ public class UrlConfigGui extends JPanel implements ChangeListener {
             autoRedirects.setSelected(getUrlConfigDefaults().isAutoRedirects());// Default changed in 2.3 and again in 2.4
             autoRedirects.setVisible(getUrlConfigDefaults().isAutoRedirectsVisible());
 
-            useKeepAlive = new JCheckBox(JMeterUtils.getResString("use_keepalive")); // $NON-NLS-1$
+            useKeepAlive = new JBooleanPropertyEditor(
+                    HTTPSamplerBaseSchema.INSTANCE.getUseKeepalive(),
+                    JMeterUtils.getResString("use_keepalive"));
             JFactory.small(useKeepAlive);
-            useKeepAlive.setSelected(getUrlConfigDefaults().isUseKeepAlive());
+            useKeepAlive.setBooleanValue(getUrlConfigDefaults().isUseKeepAlive());
             useKeepAlive.setVisible(getUrlConfigDefaults().isUseKeepAliveVisible());
 
-            useMultipart = new JCheckBox(JMeterUtils.getResString("use_multipart_for_http_post")); // $NON-NLS-1$
+            useMultipart = new JBooleanPropertyEditor(
+                    HTTPSamplerBaseSchema.INSTANCE.getUseMultipartPost(),
+                    JMeterUtils.getResString("use_multipart_for_http_post")); // $NON-NLS-1$
             JFactory.small(useMultipart);
-            useMultipart.setSelected(getUrlConfigDefaults().isUseMultipart());
+            useMultipart.setBooleanValue(getUrlConfigDefaults().isUseMultipart());
             useMultipart.setVisible(getUrlConfigDefaults().isUseMultipartVisible());
 
-            useBrowserCompatibleMultipartMode = new JCheckBox(JMeterUtils.getResString("use_multipart_mode_browser")); // $NON-NLS-1$
+            useBrowserCompatibleMultipartMode = new JBooleanPropertyEditor(
+                    HTTPSamplerBaseSchema.INSTANCE.getUseBrowserCompatibleMultipart(),
+                    JMeterUtils.getResString("use_multipart_mode_browser")); // $NON-NLS-1$
             JFactory.small(useBrowserCompatibleMultipartMode);
-            useBrowserCompatibleMultipartMode.setSelected(getUrlConfigDefaults().isUseBrowserCompatibleMultipartMode());
+            useBrowserCompatibleMultipartMode.setBooleanValue(getUrlConfigDefaults().isUseBrowserCompatibleMultipartMode());
             useBrowserCompatibleMultipartMode.setVisible(getUrlConfigDefaults().isUseBrowserCompatibleMultipartModeVisible());
         }
 

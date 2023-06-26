@@ -16,15 +16,17 @@
  */
 
 import com.github.autostyle.gradle.AutostyleTask
+import com.github.vlsi.gradle.ide.IdeExtension
 
 plugins {
-    id("com.github.vlsi.ide")
+    id("java-test-fixtures")
+    id("build-logic.jvm-published-library")
 }
 
 dependencies {
-    api(project(":src:launcher"))
-    api(project(":src:jorphan"))
-    testImplementation(project(":src:jorphan", "testClasses"))
+    api(projects.src.launcher)
+    api(projects.src.jorphan)
+    testImplementation(testFixtures(projects.src.jorphan))
 
     api("bsf:bsf") {
         because("protected BSFManager BSFTestElement#getManager()")
@@ -52,6 +54,12 @@ dependencies {
     }
     api("xalan:xalan") {
         because("PropertiesBasedPrefixResolver extends PrefixResolverDefault")
+    }
+    api("xalan:serializer") {
+        because("Xalan 2.7.3 misses xalan:serializer dependency in pom.xml, see https://issues.apache.org/jira/browse/XALANJ-2649")
+    }
+    api("xml-apis:xml-apis") {
+        because("Xalan 2.7.3 misses xml-apis:xml-apis dependency in pom.xml, see https://issues.apache.org/jira/browse/XALANJ-2649")
     }
     // Note: Saxon should go AFTER xalan so xalan XSLT is used
     // org.apache.jmeter.util.XPathUtilTest.testFormatXmlSimple assumes xalan transformer
@@ -83,17 +91,11 @@ dependencies {
     implementation("commons-codec:commons-codec") {
         because("DigestUtils")
     }
-    implementation("commons-collections:commons-collections") {
+    runtimeOnly("commons-collections:commons-collections") {
         because("Compatibility for old plugins")
     }
-    implementation("org.jetbrains.lets-plot:lets-plot-batik") {
-        // See https://github.com/JetBrains/lets-plot/issues/471
-        exclude("org.jetbrains.kotlin", "kotlin-reflect")
-    }
-    implementation("org.jetbrains.lets-plot:lets-plot-kotlin-jvm") {
-        // See https://github.com/JetBrains/lets-plot/issues/471
-        exclude("org.jetbrains.kotlin", "kotlin-reflect")
-    }
+    implementation("org.jetbrains.lets-plot:lets-plot-batik")
+    implementation("org.jetbrains.lets-plot:lets-plot-kotlin-jvm")
     implementation("org.apache.commons:commons-collections4")
     implementation("org.apache.commons:commons-math3") {
         because("Mean, DescriptiveStatistics")
@@ -119,6 +121,12 @@ dependencies {
 
     testImplementation("commons-net:commons-net")
     testRuntimeOnly("org.spockframework:spock-core")
+
+    testFixturesApi(testFixtures(projects.src.jorphan))
+    testFixturesImplementation("junit:junit")
+    testFixturesImplementation("org.spockframework:spock-core")
+    testFixturesImplementation(projects.src.testkit)
+    testFixturesImplementation("org.junit.jupiter:junit-jupiter")
 }
 
 val generatedVersionDir = File(buildDir, "generated/sources/version")
@@ -140,11 +148,18 @@ val versionClass by tasks.registering(Sync::class) {
     into(generatedVersionDir)
 }
 
-ide {
+// For some reason, using `ide { ... }` sometimes causes
+// Caused by: java.lang.IllegalStateException: couldn't find inline method
+// Lorg/gradle/kotlin/dsl/Accessorslkzxmv806rumtqvft7195qyhKt;.getIde(Lorg/gradle/api/Project;)Lcom/github/vlsi/gradle/ide/IdeExtension;
+configure<IdeExtension> {
     generatedJavaSources(versionClass.get(), generatedVersionDir)
 }
 
 // <editor-fold defaultstate="collapsed" desc="Gradle can't infer task dependencies, however it sees they use the same directories. So we add the dependencies">
+tasks.sourcesJar {
+    dependsOn(versionClass)
+}
+
 plugins.withId("org.jetbrains.kotlin.jvm") {
     tasks.named("compileKotlin") {
         dependsOn(versionClass)
