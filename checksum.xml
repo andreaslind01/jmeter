@@ -37,6 +37,7 @@
     <trusted-key id='7616eb882daf57a11477aaf559a252fb1199d873' group='com.google.code.findbugs' />
     <trusted-key id='afcc4c7594d09e2182c60e0f7a01b0f236e5430f' group='com.google.code.gson' />
     <trusted-key id='c7be5bcc9fec15518cfda882b0f3710fa64900e7' group='com.google.code.gson' />
+    <trusted-key id='187366a3ffe6bf8f94b9136a9987b20c8f6a3064' group='com.google.errorprone' />
     <trusted-key id='7615ad56144df2376f49d98b1669c4bb543e0445' group='com.google.errorprone' />
     <trusted-key id='e77417ac194160a3fabd04969a259c7ee636c5ed' group='com.google.errorprone' />
     <trusted-key id='ee0ca873074092f806f59b65d364abaa39a47320' group='com.google.errorprone' />
@@ -46,6 +47,8 @@
     <trusted-key id='bdb5fa4fe719d787fb3d3197f6d4a1d411e9d1ae' group='com.google.guava' />
     <trusted-key id='d5f46bc0b86af5dc56df58f05e975cb00c643dbf' group='com.google.inject' />
     <trusted-key id='b801e2f8ef035068ec1139cc29579f18fa8fd93b' group='com.google.j2objc' />
+    <trusted-key id='eb1b3de71713c9ec2e87cc26ee92349ad86de446' group='com.google.j2objc' />
+    <trusted-key id='187366a3ffe6bf8f94b9136a9987b20c8f6a3064' group='com.google.protobuf' />
     <trusted-key id='d75e25b78ebb19e47c0a99bca7764f502a938c99' group='com.google.protobuf' />
     <trusted-key id='f1a51e051f527e0c8e24d54d4b1e11d5a4b91e89' group='com.google.protobuf' />
     <trusted-key id='a9789342f598ad5b1175ef357eb97d110dfadd60' group='com.googlecode.concurrent-trees' />
@@ -84,6 +87,7 @@
     <trusted-key id='aa417737bd805456db3cbdde6601e5c08dccbb96' group='info.picocli' />
     <trusted-key id='c62c0ce2e5c346b2d9bf2d8bb2ca0dfe9ed21c6e' group='io.burt' />
     <trusted-key id='1ab9bdf40ed49debb5caaded5b30d3b10694f057' group='io.codearte.gradle.nexus' />
+    <trusted-key id='7186bbf993566d8c2f4f7ed7d945e643368fef62' group='io.github.eisop' />
     <trusted-key id='d477d51812e692011db11e66a6ea2e2bf22e0543' group='io.github.java-diff-utils' />
     <trusted-key id='e52567d2589415bd74eb4c2867631bc0568801c3' group='io.github.microutils' />
     <trusted-key id='050a37a2e0577f4baa095b52602ec18d20c4661c' group='io.github.x-stream' />
@@ -291,11 +295,8 @@
     <dependency group='net.sf.json-lib' module='json-lib' version='2.3' classifier='jdk15'>
       <sha512>ED6E95BF555AD3193B527258972DAFABD73745D993DA0CECE486E34A471D080850D201864026F4F41CA0982926C264C6E6CC55D91F000CDFD5D09EE3F306735C</sha512>
     </dependency>
-    <dependency group='org.checkerframework' module='checkerframework-gradle-plugin' version='0.6.26'>
-      <sha512>D72392AFFCF4F5147AC268D506341A2EBC5F96C6B43D2E8FE22EC1774228E3D60BF36FA21A81E17B2E5B0F64955012E8783645744D9C9C60196A55B7E810951D</sha512>
-    </dependency>
-    <dependency group='org.checkerframework' module='checkerframework-gradle-plugin' version='0.6.27'>
-      <sha512>2FE56362DD1FD89C2183E7C27ED6AECAEE2795FABD3CE2849EAFC86D12AB2AF4346D80C30A25536556736D6092A369CFDE05D979E97B74267DC7D57DABBDD075</sha512>
+    <dependency group='org.checkerframework' module='checkerframework-gradle-plugin' version='0.6.28'>
+      <sha512>976E7FECDEC7793A0E44562972DC86D16416913DD58C9A9A24A69DC7A32E2FC7B651505E6916F6CC50D91EC82629284C58AFCBB233277E7635B8777DA07F228C</sha512>
     </dependency>
     <dependency group='org.codehaus.groovy.modules.http-builder' module='http-builder' version='0.7.1'>
       <sha512>BC7BC2A514F8CA104A392ECF8736F4A3D316EE988FA91299D33B0AF46134B38E14E4A5061449D17B2DF7A521643E6C02DFA37CC277ED7CAB7CE83C28C00E9719</sha512>

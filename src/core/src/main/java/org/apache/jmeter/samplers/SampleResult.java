@@ -56,22 +56,17 @@ public class SampleResult implements Serializable, Cloneable, Searchable {
      * The default encoding to be used if not overridden.
      * The value is ISO-8859-1.
      */
-    public static final String DEFAULT_HTTP_ENCODING = StandardCharsets.ISO_8859_1.name();
+    public static final String DEFAULT_HTTP_ENCODING = StandardCharsets.UTF_8.name();
 
     private static final String OK_CODE = Integer.toString(HttpURLConnection.HTTP_OK);
     private static final String OK_MSG = "OK"; // $NON-NLS-1$
     private static final String INVALID_CALL_SEQUENCE_MSG = "Invalid call sequence"; // $NON-NLS-1$
 
 
-    // Bug 33196 - encoding ISO-8859-1 is only suitable for Western countries
-    // However the suggested System.getProperty("file.encoding") is Cp1252 on
-    // Windows
-    // So use a new property with the original value as default
-    // needs to be accessible from test code
     /**
      * The default encoding to be used to decode the responseData byte array.
      * The value is defined by the property "sampleresult.default.encoding"
-     * with a default of DEFAULT_HTTP_ENCODING if that is not defined.
+     * with a default of {@link #DEFAULT_HTTP_ENCODING} if that is not defined.
      */
     protected static final String DEFAULT_ENCODING
             = JMeterUtils.getPropDefault("sampleresult.default.encoding", // $NON-NLS-1$

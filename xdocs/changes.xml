@@ -45,108 +45,30 @@ h3 { color: #960000; }
 Earlier changes are detailed in the <a href="changes_history.html">History of Previous Changes</a>.
 </note>
 
+<br></br>
+<note>
+JMeter 5.6.x requires Java 8 or later for execution (Java 17 or later recommended).
+<br></br>
+<b>The next major release would require Java 11 or later.</b>
+</note>
 
-<!--  =================== 5.6.1 =================== -->
+<!--  =================== 5.6.3 =================== -->
 
-<h1>Version 5.6.1</h1>
+<h1>Version 5.6.3 </h1>
 <p>
 Summary
 </p>
 <ul>
-<li><a href="#New and Noteworthy">New and Noteworthy</a></li>
-<li><a href="#Incompatible changes">Incompatible changes</a></li>
 <li><a href="#Bug fixes">Bug fixes</a></li>
-<li><a href="#Improvements">Improvements</a></li>
-<li><a href="#Non-functional changes">Non-functional changes</a></li>
-<li><a href="#Known problems and workarounds">Known problems and workarounds</a></li>
-<li><a href="#Thanks">Thanks</a></li>
-
-</ul>
-
-<ch_section>New and Noteworthy</ch_section>
-
-<ch_section>Improvements</ch_section>
-
-<h3>Thread Groups</h3>
-<ul>
-</ul>
-
-<h3>HTTP Samplers and Test Script Recorder</h3>
-<ul>
-</ul>
-
-<h3>Other samplers</h3>
-<ul>
-</ul>
-
-<h3>Controllers</h3>
-<ul>
-</ul>
-
-<h3>Listeners</h3>
-<ul>
-</ul>
-
-<h3>Timers, Assertions, Config, Pre- &amp; Post-Processors</h3>
-<ul>
-</ul>
-
-<h3>Report / Dashboard</h3>
-<ul>
-</ul>
-
-<h3>General</h3>
-<ul>
-</ul>
-
-<ch_section>Non-functional changes</ch_section>
-<ul>
-  <li><pr>6000</pr>Add release-drafter for populating GitHub releases info based on the merged PRs</li>
-  <li><pr>5989</pr>Use Gradle toolchains for JDK provisioning, enable building and testing with different JDKs, start testing with Java 21</li>
 </ul>
 
  <!-- =================== Bug fixes =================== -->
 
 <ch_section>Bug fixes</ch_section>
 
-<h3>HTTP Samplers and Test Script Recorder</h3>
-<ul>
-</ul>
-
-<h3>Other Samplers</h3>
-<ul>
-</ul>
-
-<h3>Controllers</h3>
-<ul>
-</ul>
-
-<h3>Listeners</h3>
-<ul>
-</ul>
-
-<h3>Timers, Assertions, Config, Pre- &amp; Post-Processors</h3>
-<ul>
-</ul>
-
-<h3>Functions</h3>
-<ul>
-</ul>
-
-<h3>I18N</h3>
-<ul>
-</ul>
-
-<h3>Report / Dashboard</h3>
-<ul>
-</ul>
-
-<h3>Documentation</h3>
-<ul>
-</ul>
-
 <h3>General</h3>
 <ul>
+  <li><pr></pr><issue>6043</issue>Fix computation of <code>min</code> in <code>Summary report</code> (regression since 5.6.0)</li>
 </ul>
 
  <!--  =================== Thanks =================== -->

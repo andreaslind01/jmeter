@@ -42,9 +42,9 @@ dependencies {
 
         api("bsf:bsf:2.4.0")
         api("cglib:cglib-nodep:3.3.0")
-        api("com.fasterxml.jackson.core:jackson-annotations:2.15.1")
-        api("com.fasterxml.jackson.core:jackson-core:2.15.1")
-        api("com.fasterxml.jackson.core:jackson-databind:2.15.1")
+        api("com.fasterxml.jackson.core:jackson-annotations:2.15.2")
+        api("com.fasterxml.jackson.core:jackson-core:2.15.2")
+        api("com.fasterxml.jackson.core:jackson-databind:2.15.2")
         api("com.fifesoft:rsyntaxtextarea:3.3.3")
         api("com.formdev:svgSalamander:1.1.4")
         api("com.github.ben-manes.caffeine:caffeine:2.9.3")
@@ -52,10 +52,10 @@ dependencies {
         api("com.github.weisj:darklaf-extensions-rsyntaxarea:0.3.4")
         api("com.github.weisj:darklaf-property-loader:2.7.3")
         api("com.github.weisj:darklaf-theme:2.7.3")
-        api("com.google.auto.service:auto-service-annotations:1.1.0")
-        api("com.google.auto.service:auto-service:1.1.0")
-        api("com.google.errorprone:error_prone_annotations:2.19.1")
-        api("com.helger.commons:ph-commons:10.2.4")
+        api("com.google.auto.service:auto-service-annotations:1.1.1")
+        api("com.google.auto.service:auto-service:1.1.1")
+        api("com.google.errorprone:error_prone_annotations:2.20.0")
+        api("com.helger.commons:ph-commons:10.2.5")
         api("com.helger:ph-css:6.5.0")
         api("com.jayway.jsonpath:json-path:2.8.0")
         api("com.miglayout:miglayout-core:5.3")
@@ -77,7 +77,7 @@ dependencies {
         api("junit:junit:4.13.2") {
             because("ApacheJMeter_junit depends on junit4")
         }
-        api("org.checkerframework:checker-qual:3.34.0")
+        api("org.checkerframework:checker-qual:3.35.0")
         api("org.hamcrest:hamcrest-core:2.2") {
             because("ApacheJMeter_junit depends on junit4")
         }
