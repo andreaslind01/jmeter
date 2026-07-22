@@ -38,6 +38,8 @@ public final class HTTPSamplerFactory {
     //+ JMX implementation attribute values (also displayed in GUI) - do not change
     public static final String IMPL_HTTP_CLIENT4 = "HttpClient4";  // $NON-NLS-1$
 
+    public static final String IMPL_HTTP_CLIENT5 = "HttpClient5";  // $NON-NLS-1$
+
     public static final String IMPL_HTTP_CLIENT3_1 = "HttpClient3.1"; // $NON-NLS-1$
 
     public static final String IMPL_JAVA = "Java"; // $NON-NLS-1$
@@ -62,7 +64,7 @@ public final class HTTPSamplerFactory {
     /**
      * Create a new instance of the required sampler type
      *
-     * @param alias HTTP_SAMPLER or HTTP_SAMPLER_APACHE or IMPL_HTTP_CLIENT3_1 or IMPL_HTTP_CLIENT4
+     * @param alias HTTP_SAMPLER or HTTP_SAMPLER_APACHE or IMPL_HTTP_CLIENT3_1, IMPL_HTTP_CLIENT4 or IMPL_HTTP_CLIENT5
      * @return the appropriate sampler
      * @throws UnsupportedOperationException if alias is not recognised
      */
@@ -76,11 +78,14 @@ public final class HTTPSamplerFactory {
         if (alias.equals(IMPL_HTTP_CLIENT4) || alias.equals(HTTP_SAMPLER_APACHE) || alias.equals(IMPL_HTTP_CLIENT3_1)) {
             return new HTTPSamplerProxy(IMPL_HTTP_CLIENT4);
         }
+        if (alias.equals(IMPL_HTTP_CLIENT5)) {
+            return new HTTPSamplerProxy(IMPL_HTTP_CLIENT5);
+        }
         throw new IllegalArgumentException("Unknown sampler type: '" + alias+"'");
     }
 
     public static String[] getImplementations(){
-        return new String[]{IMPL_HTTP_CLIENT4,IMPL_JAVA};
+        return new String[]{IMPL_HTTP_CLIENT4, IMPL_HTTP_CLIENT5, IMPL_JAVA};
     }
 
     public static HTTPAbstractImpl getImplementation(String impl, HTTPSamplerBase base){
@@ -94,6 +99,8 @@ public final class HTTPSamplerFactory {
             return new HTTPJavaImpl(base);
         } else if (IMPL_HTTP_CLIENT4.equals(impl) || IMPL_HTTP_CLIENT3_1.equals(impl)) {
             return new HTTPHC4Impl(base);
+        } else if (IMPL_HTTP_CLIENT5.equals(impl)) {
+            return new HTTPHC5Impl(base);
         } else {
             throw new IllegalArgumentException("Unknown implementation type: '"+impl+"'");
         }
