@@ -245,8 +245,8 @@ https.default.protocol=SSLv3
         <property name="Implementation" required="No"><code>Java</code>, <code>HttpClient4</code>, <code>HttpClient5</code>.
         If not specified (and not defined by HTTP Request Defaults), the default depends on the value of the JMeter property
         <code>jmeter.httpsampler</code>, failing that, the HttpClient4 implementation is used.</property>
-        <property name="HTTP Version" required="No"><code>HTTP/1.1</code> or <code>HTTP/2</code>. Applies only to the
-        <code>HttpClient5</code> implementation. An empty value uses the <code>httpclient.version</code> property, which
+        <property name="HTTP Version" required="No"><code>HTTP/1.1</code> or <code>HTTP/2</code>. Applies to the
+        <code>HttpClient5</code> and <code>Java</code> implementations. An empty value uses the <code>httpclient.version</code> property, which
         defaults to <code>HTTP/1.1</code>.</property>
         <property name="Protocol" required="No"><code>HTTP</code>, <code>HTTPS</code> or <code>FILE</code>. Default: <code>HTTP</code></property>
         <property name="Method" required="Yes"><code>GET</code>, <code>POST</code>, <code>HEAD</code>, <code>TRACE</code>,

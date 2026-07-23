@@ -267,6 +267,28 @@ public class CacheManager extends ConfigTestElement implements TestStateListener
         }
     }
 
+    /**
+     * Save the Last-Modified, Etag, and Expires headers if the result is
+     * cacheable. Version for Java HttpClient implementation.
+     *
+     * @param response response to extract header information from
+     * @param res result to decide if result is cacheable
+     */
+    public void saveDetails(java.net.http.HttpResponse<?> response, HTTPSampleResult res) {
+        final String varyHeader = response.headers().firstValue(HTTPConstants.VARY).orElse(null);
+        if (isCacheable(res, varyHeader)) {
+            String lastModified = response.headers().firstValue(HTTPConstants.LAST_MODIFIED).orElse(null);
+            String expires = response.headers().firstValue(HTTPConstants.EXPIRES).orElse(null);
+            String etag = response.headers().firstValue(HTTPConstants.ETAG).orElse(null);
+            String cacheControl = response.headers().firstValue(HTTPConstants.CACHE_CONTROL).orElse(null);
+            String date = response.headers().firstValue(HTTPConstants.DATE).orElse(null);
+            if (anyNotBlank(lastModified, expires, etag, cacheControl)) {
+                setCache(lastModified, cacheControl, expires, etag,
+                        res.getUrlAsString(), date, getVaryHeader(varyHeader, asHeaders(res.getRequestHeaders())));
+            }
+        }
+    }
+
     private static String getHeader(org.apache.hc.core5.http.HttpMessage message, String name) {
         org.apache.hc.core5.http.Header header = message.getFirstHeader(name);
         return header == null ? null : header.getValue();
