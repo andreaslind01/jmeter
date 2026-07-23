@@ -62,8 +62,7 @@ import org.xbill.DNS.Type;
  *
  * @since 2.12
  */
-public class DNSCacheManager extends ConfigTestElement implements TestIterationListener, Serializable, DnsResolver,
-        org.apache.hc.client5.http.DnsResolver {
+public class DNSCacheManager extends ConfigTestElement implements TestIterationListener, Serializable, DnsResolver {
 
     private static final long serialVersionUID = 2122L;
 
@@ -247,15 +246,6 @@ public class DNSCacheManager extends ConfigTestElement implements TestIterationL
             cache.put(host, addresses);
             return addresses;
         }
-    }
-
-    @Override
-    public String resolveCanonicalHostname(String host) throws UnknownHostException {
-        InetAddress[] addresses = resolve(host);
-        if (addresses == null || addresses.length == 0) {
-            return host;
-        }
-        return addresses[0].getCanonicalHostName();
     }
 
     private static void logCache(String hitOrMiss, String host, InetAddress[] addresses) {
