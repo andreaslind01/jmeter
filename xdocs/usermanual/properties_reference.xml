@@ -796,6 +796,8 @@ JMETER-SERVER</source>
         <dt><code>HTTPSampler2</code></dt>
         <dt><code>HttpClient4</code></dt>
         <dd>Use Apache HTTPClient version 4</dd>
+        <dt><code>HttpClient5</code></dt>
+        <dd>Use Apache HTTPClient version 5</dd>
     </dl>
     Defaults to: <code>HttpClient4</code>
 </property>

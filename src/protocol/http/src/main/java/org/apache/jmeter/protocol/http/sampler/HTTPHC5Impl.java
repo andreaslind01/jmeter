@@ -33,6 +33,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
+import org.apache.hc.client5.http.auth.AuthScope;
+import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
 import org.apache.hc.client5.http.classic.ExecChain;
 import org.apache.hc.client5.http.classic.ExecChainHandler;
 import org.apache.hc.client5.http.config.ConnectionConfig;
@@ -44,6 +46,7 @@ import org.apache.hc.client5.http.entity.GZIPInputStreamFactory;
 import org.apache.hc.client5.http.entity.InputStreamFactory;
 import org.apache.hc.client5.http.entity.UrlEncodedFormEntity;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
+import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
@@ -65,6 +68,8 @@ import org.apache.hc.core5.http.message.BasicHeaderValueParser;
 import org.apache.hc.core5.http.message.BasicNameValuePair;
 import org.apache.hc.core5.http.message.ParserCursor;
 import org.apache.hc.core5.util.Timeout;
+import org.apache.jmeter.protocol.http.control.AuthManager;
+import org.apache.jmeter.protocol.http.control.Authorization;
 import org.apache.jmeter.protocol.http.control.CacheManager;
 import org.apache.jmeter.protocol.http.control.CookieManager;
 import org.apache.jmeter.protocol.http.control.DNSCacheManager;
@@ -81,15 +86,11 @@ import org.apache.jmeter.util.JsseSSLManager;
 import org.apache.jmeter.util.SSLManager;
 import org.apache.jorphan.util.JOrphanUtils;
 import org.apache.jorphan.util.StringUtilities;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * HTTP Sampler using Apache HttpClient 5.x.
  */
 public class HTTPHC5Impl extends HTTPHCAbstractImpl {
-
-    private static final Logger log = LoggerFactory.getLogger(HTTPHC5Impl.class);
 
     private static final ThreadLocal<Map<HttpClientKey, CloseableHttpClient>> HTTP_CLIENTS =
             ThreadLocal.withInitial(HashMap::new);
@@ -162,15 +163,22 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
             CacheManager cacheManager = getCacheManager();
             if (cacheManager != null && HTTPConstants.GET.equalsIgnoreCase(method)) {
-                log.debug("Cache Manager is not supported by HttpClient5 yet");
+                if (cacheManager.inCache(url, request.getHeaders())) {
+                    return updateSampleResultForResourceInCache(result);
+                }
             }
 
             currentRequest = request;
-            response = getClient(createHttpClientKey(url)).executeOpen(null, request, null);
+            HttpClientKey clientKey = createHttpClientKey(url);
+            HttpClientContext context = createHttpClientContext(url, clientKey, request);
+            response = getClient(clientKey).executeOpen(null, request, context);
             result.sampleEnd();
             currentRequest = null;
 
             updateResult(response, request, result);
+            if (cacheManager != null) {
+                cacheManager.saveDetails(response, result);
+            }
             saveConnectionCookies(response, result.getURL(), getCookieManager());
             return resultProcessing(areFollowingRedirect, frameDepth, result);
         } catch (Exception e) {
@@ -211,6 +219,10 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         request.setHeader(HTTPConstants.HEADER_CONNECTION,
                 getUseKeepAlive() ? HTTPConstants.KEEP_ALIVE : HTTPConstants.CONNECTION_CLOSE);
         setConnectionHeaders(request, getHeaderManager());
+        CacheManager cacheManager = getCacheManager();
+        if (cacheManager != null) {
+            cacheManager.setHeaders(url, request);
+        }
 
         String cookies = setConnectionCookie(request, url, getCookieManager());
         if (StringUtilities.isNotEmpty(cookies)) {
@@ -334,6 +346,42 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return cookies;
     }
 
+    private HttpClientContext createHttpClientContext(URL url, HttpClientKey key,
+            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request) {
+        HttpClientContext context = HttpClientContext.create();
+        BasicCredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+        configureTargetCredentials(url, request, credentialsProvider);
+        configureProxyCredentials(key, credentialsProvider);
+        context.setCredentialsProvider(credentialsProvider);
+        return context;
+    }
+
+    private void configureTargetCredentials(URL url,
+            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
+            BasicCredentialsProvider credentialsProvider) {
+        AuthManager authManager = getAuthManager();
+        Authorization authorization = authManager == null ? null : authManager.getAuthForURL(url);
+        if (authorization == null) {
+            return;
+        }
+        credentialsProvider.setCredentials(new AuthScope(url.getHost(), getPort(url)),
+                new UsernamePasswordCredentials(authorization.getUser(), authorization.getPass().toCharArray()));
+        if (AuthManager.Mechanism.BASIC.equals(authorization.getMechanism())) {
+            request.setHeader(HttpHeaders.AUTHORIZATION, authorization.toBasicHeader());
+        }
+    }
+
+    private static void configureProxyCredentials(HttpClientKey key, BasicCredentialsProvider credentialsProvider) {
+        if (key.hasProxy && StringUtilities.isNotEmpty(key.proxyUser)) {
+            credentialsProvider.setCredentials(new AuthScope(key.proxyHost, key.proxyPort),
+                    new UsernamePasswordCredentials(key.proxyUser, key.proxyPass.toCharArray()));
+        }
+    }
+
+    private static int getPort(URL url) {
+        return url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
+    }
+
     private void updateResult(ClassicHttpResponse response,
             org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HTTPSampleResult result) throws IOException {
         result.setRequestHeaders(getRequestHeaders(request));
@@ -453,6 +501,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         String proxyHost = getProxyHost();
         int proxyPort = getProxyPortInt();
         int connectTimeout = getConnectTimeout();
+        String proxyUser = getProxyUser();
+        String proxyPass = getProxyPass();
         DNSCacheManager dnsCacheManager = testElement.getDNSResolver();
         InetAddress localAddress = getIpSourceAddress();
         boolean useDynamicProxy = isDynamicProxy(proxyHost, proxyPort);
@@ -463,7 +513,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             proxyPort = PROXY_PORT;
         }
         return new HttpClientKey(url.getProtocol(), url.getAuthority(), useDynamicProxy || useStaticProxy,
-                proxyScheme, proxyHost, proxyPort, connectTimeout, dnsCacheManager, localAddress);
+                proxyScheme, proxyHost, proxyPort, proxyUser, proxyPass, connectTimeout, dnsCacheManager, localAddress);
     }
 
     @Override
@@ -511,12 +561,14 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         private final String proxyScheme;
         private final String proxyHost;
         private final int proxyPort;
+        private final String proxyUser;
+        private final String proxyPass;
         private final int connectTimeout;
         private final DNSCacheManager dnsCacheManager;
         private final InetAddress localAddress;
 
         private HttpClientKey(String protocol, String authority, boolean hasProxy, String proxyScheme,
-                String proxyHost, int proxyPort, int connectTimeout, DNSCacheManager dnsCacheManager,
+                String proxyHost, int proxyPort, String proxyUser, String proxyPass, int connectTimeout, DNSCacheManager dnsCacheManager,
                 InetAddress localAddress) {
             this.protocol = protocol;
             this.authority = authority;
@@ -524,6 +576,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             this.proxyScheme = proxyScheme;
             this.proxyHost = proxyHost;
             this.proxyPort = proxyPort;
+            this.proxyUser = proxyUser;
+            this.proxyPass = proxyPass;
             this.connectTimeout = connectTimeout;
             this.dnsCacheManager = dnsCacheManager;
             this.localAddress = localAddress;
@@ -540,12 +594,13 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             return hasProxy == other.hasProxy && proxyPort == other.proxyPort && connectTimeout == other.connectTimeout
                     && Objects.equals(protocol, other.protocol) && Objects.equals(authority, other.authority)
                     && Objects.equals(proxyScheme, other.proxyScheme) && Objects.equals(proxyHost, other.proxyHost)
+                    && Objects.equals(proxyUser, other.proxyUser) && Objects.equals(proxyPass, other.proxyPass)
                     && Objects.equals(dnsCacheManager, other.dnsCacheManager) && Objects.equals(localAddress, other.localAddress);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort, connectTimeout, dnsCacheManager,
+            return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort, proxyUser, proxyPass, connectTimeout, dnsCacheManager,
                     localAddress);
         }
     }
