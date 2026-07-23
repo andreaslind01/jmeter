@@ -106,7 +106,10 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private static final ExecChainHandler RESPONSE_CONTENT_ENCODING = (request, scope, chain) -> {
         HttpClientContext context = scope.clientContext;
-        RequestConfig requestConfig = context.getRequestConfigOrDefault();
+        RequestConfig requestConfig = context.getRequestConfig();
+        if (requestConfig == null) {
+            requestConfig = RequestConfig.DEFAULT;
+        }
         ClassicHttpResponse response = chain.proceed(request, scope);
         HttpEntity entity = response.getEntity();
         if (!requestConfig.isContentCompressionEnabled() || entity == null || entity.getContentLength() == 0
