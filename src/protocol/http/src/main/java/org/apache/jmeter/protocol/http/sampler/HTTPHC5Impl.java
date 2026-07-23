@@ -24,6 +24,7 @@ import java.net.InetAddress;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLDecoder;
+import java.net.UnknownHostException;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -66,6 +67,7 @@ import org.apache.hc.core5.http.message.ParserCursor;
 import org.apache.hc.core5.util.Timeout;
 import org.apache.jmeter.protocol.http.control.CacheManager;
 import org.apache.jmeter.protocol.http.control.CookieManager;
+import org.apache.jmeter.protocol.http.control.DNSCacheManager;
 import org.apache.jmeter.protocol.http.control.HeaderManager;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
@@ -401,8 +403,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     private static CloseableHttpClient createClient(HttpClientKey key) {
         org.apache.hc.client5.http.impl.classic.HttpClientBuilder builder = HttpClients.custom().disableAutomaticRetries();
         PoolingHttpClientConnectionManagerBuilder connectionManagerBuilder = PoolingHttpClientConnectionManagerBuilder.create();
-        if (key.dnsResolver != null) {
-            connectionManagerBuilder.setDnsResolver(key.dnsResolver);
+        if (key.dnsCacheManager != null) {
+            connectionManagerBuilder.setDnsResolver(createDnsResolver(key.dnsCacheManager));
         }
         if (key.connectTimeout > 0) {
             connectionManagerBuilder
@@ -428,12 +430,27 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 .build();
     }
 
+    private static org.apache.hc.client5.http.DnsResolver createDnsResolver(DNSCacheManager dnsCacheManager) {
+        return new org.apache.hc.client5.http.DnsResolver() {
+            @Override
+            public InetAddress[] resolve(String host) throws UnknownHostException {
+                return dnsCacheManager.resolve(host);
+            }
+
+            @Override
+            public String resolveCanonicalHostname(String host) throws UnknownHostException {
+                InetAddress[] addresses = resolve(host);
+                return addresses == null || addresses.length == 0 ? host : addresses[0].getCanonicalHostName();
+            }
+        };
+    }
+
     private HttpClientKey createHttpClientKey(URL url) throws IOException {
         String proxyScheme = getProxyScheme();
         String proxyHost = getProxyHost();
         int proxyPort = getProxyPortInt();
         int connectTimeout = getConnectTimeout();
-        org.apache.hc.client5.http.DnsResolver dnsResolver = testElement.getDNSResolver();
+        DNSCacheManager dnsCacheManager = testElement.getDNSResolver();
         InetAddress localAddress = getIpSourceAddress();
         boolean useDynamicProxy = isDynamicProxy(proxyHost, proxyPort);
         boolean useStaticProxy = isStaticProxy(url.getHost());
@@ -443,7 +460,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             proxyPort = PROXY_PORT;
         }
         return new HttpClientKey(url.getProtocol(), url.getAuthority(), useDynamicProxy || useStaticProxy,
-                proxyScheme, proxyHost, proxyPort, connectTimeout, dnsResolver, localAddress);
+                proxyScheme, proxyHost, proxyPort, connectTimeout, dnsCacheManager, localAddress);
     }
 
     @Override
@@ -492,11 +509,11 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         private final String proxyHost;
         private final int proxyPort;
         private final int connectTimeout;
-        private final org.apache.hc.client5.http.DnsResolver dnsResolver;
+        private final DNSCacheManager dnsCacheManager;
         private final InetAddress localAddress;
 
         private HttpClientKey(String protocol, String authority, boolean hasProxy, String proxyScheme,
-                String proxyHost, int proxyPort, int connectTimeout, org.apache.hc.client5.http.DnsResolver dnsResolver,
+                String proxyHost, int proxyPort, int connectTimeout, DNSCacheManager dnsCacheManager,
                 InetAddress localAddress) {
             this.protocol = protocol;
             this.authority = authority;
@@ -505,7 +522,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             this.proxyHost = proxyHost;
             this.proxyPort = proxyPort;
             this.connectTimeout = connectTimeout;
-            this.dnsResolver = dnsResolver;
+            this.dnsCacheManager = dnsCacheManager;
             this.localAddress = localAddress;
         }
 
@@ -520,12 +537,12 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             return hasProxy == other.hasProxy && proxyPort == other.proxyPort && connectTimeout == other.connectTimeout
                     && Objects.equals(protocol, other.protocol) && Objects.equals(authority, other.authority)
                     && Objects.equals(proxyScheme, other.proxyScheme) && Objects.equals(proxyHost, other.proxyHost)
-                    && Objects.equals(dnsResolver, other.dnsResolver) && Objects.equals(localAddress, other.localAddress);
+                    && Objects.equals(dnsCacheManager, other.dnsCacheManager) && Objects.equals(localAddress, other.localAddress);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort, connectTimeout, dnsResolver,
+            return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort, connectTimeout, dnsCacheManager,
                     localAddress);
         }
     }
