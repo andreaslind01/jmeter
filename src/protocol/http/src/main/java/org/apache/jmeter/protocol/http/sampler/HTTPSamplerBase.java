@@ -160,6 +160,8 @@ public abstract class HTTPSamplerBase extends AbstractSampler
 
     public static final String IMPLEMENTATION = "HTTPSampler.implementation"; // $NON-NLS-1$
 
+    public static final String HTTP_VERSION = "HTTPSampler.httpVersion"; // $NON-NLS-1$
+
     public static final String PATH = "HTTPSampler.path"; // $NON-NLS-1$
 
     public static final String FOLLOW_REDIRECTS = HTTPSamplerBaseSchema.INSTANCE.getFollowRedirects().getName();
@@ -638,6 +640,14 @@ public abstract class HTTPSamplerBase extends AbstractSampler
 
     public String getImplementation() {
         return get(getSchema().getImplementation());
+    }
+
+    public void setHttpVersion(String value) {
+        set(getSchema().getHttpVersion(), value);
+    }
+
+    public String getHttpVersion() {
+        return get(getSchema().getHttpVersion());
     }
 
     public boolean useMD5() {

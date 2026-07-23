@@ -442,8 +442,9 @@ JMETER-SERVER</source>
     Defaults to: <code>0</code>
 </property>
 <property name="httpclient.version">
-    Set the http version.<br/>
-    Defaults to: <code>1.1</code> (or use the parameter <code>http.protocol.version</code>)
+    Set the default HTTP version for HttpClient5 samplers with an empty HTTP Version value.<br/>
+    Valid values are <code>HTTP/1.1</code> and <code>HTTP/2</code>.<br/>
+    Defaults to: <code>HTTP/1.1</code>
 </property>
 <property name="httpclient.socket.http.cps">
     Set characters per second to a value greater then zero to emulate slow connections.<br/>
