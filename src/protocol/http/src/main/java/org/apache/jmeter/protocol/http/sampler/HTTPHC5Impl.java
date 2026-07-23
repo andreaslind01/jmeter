@@ -20,6 +20,7 @@ package org.apache.jmeter.protocol.http.sampler;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLDecoder;
@@ -27,25 +28,41 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
+import org.apache.hc.client5.http.classic.ExecChain;
+import org.apache.hc.client5.http.classic.ExecChainHandler;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.entity.BrotliInputStreamFactory;
+import org.apache.hc.client5.http.entity.DecompressingEntity;
+import org.apache.hc.client5.http.entity.DeflateInputStreamFactory;
+import org.apache.hc.client5.http.entity.GZIPInputStreamFactory;
+import org.apache.hc.client5.http.entity.InputStreamFactory;
 import org.apache.hc.client5.http.entity.UrlEncodedFormEntity;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.impl.routing.DefaultRoutePlanner;
+import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.Header;
+import org.apache.hc.core5.http.HeaderElement;
 import org.apache.hc.core5.http.HttpEntity;
+import org.apache.hc.core5.http.HttpHeaders;
 import org.apache.hc.core5.http.HttpHost;
 import org.apache.hc.core5.http.NameValuePair;
+import org.apache.hc.core5.http.config.Lookup;
+import org.apache.hc.core5.http.config.RegistryBuilder;
 import org.apache.hc.core5.http.io.entity.FileEntity;
 import org.apache.hc.core5.http.io.entity.StringEntity;
+import org.apache.hc.core5.http.message.BasicHeaderValueParser;
 import org.apache.hc.core5.http.message.BasicNameValuePair;
+import org.apache.hc.core5.http.message.ParserCursor;
 import org.apache.hc.core5.util.Timeout;
 import org.apache.jmeter.protocol.http.control.CacheManager;
 import org.apache.jmeter.protocol.http.control.CookieManager;
@@ -74,6 +91,52 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private static final ThreadLocal<Map<HttpClientKey, CloseableHttpClient>> HTTP_CLIENTS =
             ThreadLocal.withInitial(HashMap::new);
+
+    private static final String[] HEADERS_TO_SAVE = {HttpHeaders.CONTENT_LENGTH, HttpHeaders.CONTENT_ENCODING,
+            HttpHeaders.CONTENT_MD5};
+
+    private static final Lookup<InputStreamFactory> CONTENT_DECODERS = RegistryBuilder.<InputStreamFactory>create()
+            .register("br", BrotliInputStreamFactory.getInstance())
+            .register("gzip", GZIPInputStreamFactory.getInstance())
+            .register("x-gzip", GZIPInputStreamFactory.getInstance())
+            .register("deflate", DeflateInputStreamFactory.getInstance())
+            .build();
+
+    private static final ExecChainHandler RESPONSE_CONTENT_ENCODING = (request, scope, chain) -> {
+        HttpClientContext context = scope.clientContext;
+        RequestConfig requestConfig = context.getRequestConfigOrDefault();
+        ClassicHttpResponse response = chain.proceed(request, scope);
+        HttpEntity entity = response.getEntity();
+        if (!requestConfig.isContentCompressionEnabled() || entity == null || entity.getContentLength() == 0
+                || entity.getContentEncoding() == null) {
+            return response;
+        }
+
+        Header[][] headersToSave = new Header[HEADERS_TO_SAVE.length][];
+        for (int i = 0; i < HEADERS_TO_SAVE.length; i++) {
+            headersToSave[i] = response.getHeaders(HEADERS_TO_SAVE[i]);
+        }
+        String contentEncoding = entity.getContentEncoding();
+        HeaderElement[] codecs = BasicHeaderValueParser.INSTANCE.parseElements(contentEncoding,
+                new ParserCursor(0, contentEncoding.length()));
+        for (HeaderElement codec : codecs) {
+            InputStreamFactory decoderFactory = CONTENT_DECODERS.lookup(codec.getName().toLowerCase(Locale.ROOT));
+            if (decoderFactory != null) {
+                response.setEntity(new DecompressingEntity(response.getEntity(), decoderFactory));
+                response.removeHeaders(HttpHeaders.CONTENT_LENGTH);
+                response.removeHeaders(HttpHeaders.CONTENT_ENCODING);
+                response.removeHeaders(HttpHeaders.CONTENT_MD5);
+            }
+        }
+        for (Header[] headers : headersToSave) {
+            for (Header header : headers) {
+                if (!response.containsHeader(header.getName())) {
+                    response.addHeader(header);
+                }
+            }
+        }
+        return response;
+    };
 
     private volatile org.apache.hc.client5.http.classic.methods.HttpUriRequestBase currentRequest;
 
@@ -337,24 +400,41 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private static CloseableHttpClient createClient(HttpClientKey key) {
         org.apache.hc.client5.http.impl.classic.HttpClientBuilder builder = HttpClients.custom().disableAutomaticRetries();
+        PoolingHttpClientConnectionManagerBuilder connectionManagerBuilder = PoolingHttpClientConnectionManagerBuilder.create();
+        if (key.dnsResolver != null) {
+            connectionManagerBuilder.setDnsResolver(key.dnsResolver);
+        }
         if (key.connectTimeout > 0) {
-            builder.setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create()
+            connectionManagerBuilder
                     .setDefaultConnectionConfig(ConnectionConfig.custom()
                             .setConnectTimeout(Timeout.ofMilliseconds(key.connectTimeout))
-                            .build())
-                    .build());
+                            .build());
         }
-        if (key.hasProxy) {
-            builder.setProxy(new HttpHost(key.proxyScheme, key.proxyHost, key.proxyPort));
-        }
-        return builder.build();
+        builder.setConnectionManager(connectionManagerBuilder.build());
+        builder.setRoutePlanner(new DefaultRoutePlanner(null) {
+            @Override
+            protected HttpHost determineProxy(HttpHost target, org.apache.hc.core5.http.protocol.HttpContext context) {
+                return key.hasProxy ? new HttpHost(key.proxyScheme, key.proxyHost, key.proxyPort) : null;
+            }
+
+            @Override
+            protected InetAddress determineLocalAddress(HttpHost firstHop,
+                    org.apache.hc.core5.http.protocol.HttpContext context) {
+                return key.localAddress;
+            }
+        });
+        return builder.disableContentCompression()
+                .addExecInterceptorFirst("response-content-encoding", RESPONSE_CONTENT_ENCODING)
+                .build();
     }
 
-    private HttpClientKey createHttpClientKey(URL url) {
+    private HttpClientKey createHttpClientKey(URL url) throws IOException {
         String proxyScheme = getProxyScheme();
         String proxyHost = getProxyHost();
         int proxyPort = getProxyPortInt();
         int connectTimeout = getConnectTimeout();
+        org.apache.hc.client5.http.DnsResolver dnsResolver = testElement.getDNSResolver();
+        InetAddress localAddress = getIpSourceAddress();
         boolean useDynamicProxy = isDynamicProxy(proxyHost, proxyPort);
         boolean useStaticProxy = isStaticProxy(url.getHost());
         if (!useDynamicProxy) {
@@ -363,7 +443,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             proxyPort = PROXY_PORT;
         }
         return new HttpClientKey(url.getProtocol(), url.getAuthority(), useDynamicProxy || useStaticProxy,
-                proxyScheme, proxyHost, proxyPort, connectTimeout);
+                proxyScheme, proxyHost, proxyPort, connectTimeout, dnsResolver, localAddress);
     }
 
     @Override
@@ -412,9 +492,12 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         private final String proxyHost;
         private final int proxyPort;
         private final int connectTimeout;
+        private final org.apache.hc.client5.http.DnsResolver dnsResolver;
+        private final InetAddress localAddress;
 
         private HttpClientKey(String protocol, String authority, boolean hasProxy, String proxyScheme,
-                String proxyHost, int proxyPort, int connectTimeout) {
+                String proxyHost, int proxyPort, int connectTimeout, org.apache.hc.client5.http.DnsResolver dnsResolver,
+                InetAddress localAddress) {
             this.protocol = protocol;
             this.authority = authority;
             this.hasProxy = hasProxy;
@@ -422,6 +505,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             this.proxyHost = proxyHost;
             this.proxyPort = proxyPort;
             this.connectTimeout = connectTimeout;
+            this.dnsResolver = dnsResolver;
+            this.localAddress = localAddress;
         }
 
         @Override
@@ -434,12 +519,14 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             }
             return hasProxy == other.hasProxy && proxyPort == other.proxyPort && connectTimeout == other.connectTimeout
                     && Objects.equals(protocol, other.protocol) && Objects.equals(authority, other.authority)
-                    && Objects.equals(proxyScheme, other.proxyScheme) && Objects.equals(proxyHost, other.proxyHost);
+                    && Objects.equals(proxyScheme, other.proxyScheme) && Objects.equals(proxyHost, other.proxyHost)
+                    && Objects.equals(dnsResolver, other.dnsResolver) && Objects.equals(localAddress, other.localAddress);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort, connectTimeout);
+            return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort, connectTimeout, dnsResolver,
+                    localAddress);
         }
     }
 }
