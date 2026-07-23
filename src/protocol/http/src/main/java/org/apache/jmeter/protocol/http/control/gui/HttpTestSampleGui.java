@@ -81,6 +81,7 @@ public class HttpTestSampleGui extends AbstractSamplerGui {
     private JTextField proxyUser;
     private JPasswordField proxyPass;
     private final JComboBox<String> httpImplementation = new JComboBox<>(HTTPSamplerFactory.getImplementations());
+    private final JComboBox<String> httpVersion = new JComboBox<>(new String[] {"", "HTTP/1.1", "HTTP/2"});
     private JTextField connectTimeOut;
     private JTextField responseTimeOut;
 
@@ -135,6 +136,7 @@ public class HttpTestSampleGui extends AbstractSamplerGui {
         if (!isAJP) {
             sourceIpType.setSelectedIndex(samplerBase.getIpSourceType());
             httpImplementation.setSelectedItem(samplerBase.getString(httpSchema.getImplementation()));
+            httpVersion.setSelectedItem(samplerBase.getHttpVersion());
         }
     }
 
@@ -179,6 +181,9 @@ public class HttpTestSampleGui extends AbstractSamplerGui {
             String selectedImplementation = String.valueOf(httpImplementation.getSelectedItem());
             samplerBase.set(httpSchema.getImplementation(),
                     StringUtilities.isBlank(selectedImplementation) ? null : selectedImplementation);
+            String selectedHttpVersion = String.valueOf(httpVersion.getSelectedItem());
+            samplerBase.set(httpSchema.getHttpVersion(),
+                    StringUtilities.isBlank(selectedHttpVersion) ? null : selectedHttpVersion);
         }
     }
 
@@ -349,6 +354,8 @@ public class HttpTestSampleGui extends AbstractSamplerGui {
         implPanel.add(new JLabel(JMeterUtils.getResString("http_implementation"))); // $NON-NLS-1$
         httpImplementation.addItem("");// $NON-NLS-1$
         implPanel.add(httpImplementation);
+        implPanel.add(new JLabel(JMeterUtils.getResString("http_version"))); // $NON-NLS-1$
+        implPanel.add(httpVersion);
         return implPanel;
     }
 

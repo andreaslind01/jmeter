@@ -79,6 +79,7 @@ public class HttpDefaultsGui extends AbstractConfigGui {
     private JTextField proxyUser;
     private JPasswordField proxyPass;
     private final JComboBox<String> httpImplementation = new JComboBox<>(HTTPSamplerFactory.getImplementations());
+    private final JComboBox<String> httpVersion = new JComboBox<>(new String[] {"", "HTTP/1.1", "HTTP/2"});
     private JTextField connectTimeOut;
     private JTextField responseTimeOut;
 
@@ -152,6 +153,7 @@ public class HttpDefaultsGui extends AbstractConfigGui {
         }
 
         config.set(httpSchema.getImplementation(), String.valueOf(httpImplementation.getSelectedItem()));
+        config.set(httpSchema.getHttpVersion(), String.valueOf(httpVersion.getSelectedItem()));
     }
 
     @Override
@@ -169,6 +171,7 @@ public class HttpDefaultsGui extends AbstractConfigGui {
         HTTPSamplerBaseSchema httpSchema = HTTPSamplerBaseSchema.INSTANCE;
         sourceIpType.setSelectedIndex(samplerBase.get(httpSchema.getIpSourceType()));
         httpImplementation.setSelectedItem(samplerBase.getString(httpSchema.getImplementation()));
+        httpVersion.setSelectedItem(samplerBase.getString(httpSchema.getHttpVersion()));
     }
 
     private void init() { // WARNING: called from ctor so must not be overridden (i.e. must be private or final)
@@ -329,6 +332,8 @@ public class HttpDefaultsGui extends AbstractConfigGui {
         implPanel.add(new JLabel(JMeterUtils.getResString("http_implementation"))); // $NON-NLS-1$
         httpImplementation.addItem("");// $NON-NLS-1$
         implPanel.add(httpImplementation);
+        implPanel.add(new JLabel(JMeterUtils.getResString("http_version"))); // $NON-NLS-1$
+        implPanel.add(httpVersion);
         return implPanel;
     }
 

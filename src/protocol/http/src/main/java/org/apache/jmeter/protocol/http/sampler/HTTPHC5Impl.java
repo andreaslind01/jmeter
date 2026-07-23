@@ -26,19 +26,28 @@ import java.net.URL;
 import java.net.URLDecoder;
 import java.net.UnknownHostException;
 import java.nio.charset.Charset;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeoutException;
 
+import javax.net.ssl.SSLContext;
+
+import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
+import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
 import org.apache.hc.client5.http.auth.AuthScope;
 import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
 import org.apache.hc.client5.http.classic.ExecChain;
 import org.apache.hc.client5.http.classic.ExecChainHandler;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.config.TlsConfig;
 import org.apache.hc.client5.http.entity.BrotliInputStreamFactory;
 import org.apache.hc.client5.http.entity.DecompressingEntity;
 import org.apache.hc.client5.http.entity.DeflateInputStreamFactory;
@@ -46,12 +55,18 @@ import org.apache.hc.client5.http.entity.GZIPInputStreamFactory;
 import org.apache.hc.client5.http.entity.InputStreamFactory;
 import org.apache.hc.client5.http.entity.UrlEncodedFormEntity;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
+import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
+import org.apache.hc.client5.http.impl.async.H2AsyncClientBuilder;
+import org.apache.hc.client5.http.impl.async.HttpAsyncClients;
 import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.impl.routing.DefaultRoutePlanner;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
+import org.apache.hc.client5.http.ssl.ClientTlsStrategyBuilder;
+import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
+import org.apache.hc.client5.http.ssl.TrustAllStrategy;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.Header;
@@ -59,14 +74,21 @@ import org.apache.hc.core5.http.HeaderElement;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.HttpHeaders;
 import org.apache.hc.core5.http.HttpHost;
+import org.apache.hc.core5.http.HttpVersion;
 import org.apache.hc.core5.http.NameValuePair;
 import org.apache.hc.core5.http.config.Lookup;
 import org.apache.hc.core5.http.config.RegistryBuilder;
+import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.http.io.entity.FileEntity;
 import org.apache.hc.core5.http.io.entity.StringEntity;
+import org.apache.hc.core5.http.message.BasicClassicHttpResponse;
 import org.apache.hc.core5.http.message.BasicHeaderValueParser;
 import org.apache.hc.core5.http.message.BasicNameValuePair;
 import org.apache.hc.core5.http.message.ParserCursor;
+import org.apache.hc.core5.http.nio.ssl.TlsStrategy;
+import org.apache.hc.core5.http2.HttpVersionPolicy;
+import org.apache.hc.core5.ssl.SSLContexts;
 import org.apache.hc.core5.util.Timeout;
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.Authorization;
@@ -95,6 +117,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     private static final ThreadLocal<Map<HttpClientKey, CloseableHttpClient>> HTTP_CLIENTS =
             ThreadLocal.withInitial(HashMap::new);
 
+    private static final ThreadLocal<Map<HttpClientKey, CloseableHttpAsyncClient>> HTTP_2_CLIENTS =
+            ThreadLocal.withInitial(HashMap::new);
+
     private static final String[] HEADERS_TO_SAVE = {HttpHeaders.CONTENT_LENGTH, HttpHeaders.CONTENT_ENCODING,
             HttpHeaders.CONTENT_MD5};
 
@@ -104,6 +129,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             .register("x-gzip", GZIPInputStreamFactory.getInstance())
             .register("deflate", DeflateInputStreamFactory.getInstance())
             .build();
+
+    private static final TlsStrategy HTTP_2_TLS_STRATEGY = createHttp2TlsStrategy();
 
     private static final ExecChainHandler RESPONSE_CONTENT_ENCODING = (request, scope, chain) -> {
         HttpClientContext context = scope.clientContext;
@@ -146,6 +173,19 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private volatile org.apache.hc.client5.http.classic.methods.HttpUriRequestBase currentRequest;
 
+    @SuppressWarnings("deprecation") // buildAsync is unavailable before HttpClient 5.5
+    private static TlsStrategy createHttp2TlsStrategy() {
+        try {
+            SSLContext sslContext = SSLContexts.custom().loadTrustMaterial(null, TrustAllStrategy.INSTANCE).build();
+            return ClientTlsStrategyBuilder.create()
+                    .setSslContext(sslContext)
+                    .setHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+                    .build();
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("Could not create HTTP/2 TLS strategy", e);
+        }
+    }
+
     protected HTTPHC5Impl(HTTPSamplerBase testElement) {
         super(testElement);
     }
@@ -171,7 +211,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             currentRequest = request;
             HttpClientKey clientKey = createHttpClientKey(url);
             HttpClientContext context = createHttpClientContext(url, clientKey, request);
-            response = getClient(clientKey).executeOpen(null, request, context);
+            response = clientKey.httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_2
+                    ? executeHttp2(getHttp2Client(clientKey), request, context)
+                    : getClient(clientKey).executeOpen(null, request, context);
             result.sampleEnd();
             currentRequest = null;
 
@@ -209,6 +251,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private void setupRequest(URL url, org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
             HTTPSampleResult result, boolean areFollowingRedirect) throws IOException {
+        HttpVersionPolicy httpVersionPolicy = getHttpVersionPolicy(testElement.getHttpVersion(), HTTP_VERSION);
         RequestConfig.Builder config = RequestConfig.custom()
                 .setRedirectsEnabled(getAutoRedirects() && !areFollowingRedirect);
         int responseTimeout = getResponseTimeout();
@@ -216,9 +259,13 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             config.setResponseTimeout(Timeout.ofMilliseconds(responseTimeout));
         }
         request.setConfig(config.build());
-        request.setHeader(HTTPConstants.HEADER_CONNECTION,
-                getUseKeepAlive() ? HTTPConstants.KEEP_ALIVE : HTTPConstants.CONNECTION_CLOSE);
-        setConnectionHeaders(request, getHeaderManager());
+        if (httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_1) {
+            request.setHeader(HTTPConstants.HEADER_CONNECTION,
+                    getUseKeepAlive() ? HTTPConstants.KEEP_ALIVE : HTTPConstants.CONNECTION_CLOSE);
+        } else {
+            request.setVersion(HttpVersion.HTTP_2);
+        }
+        setConnectionHeaders(request, getHeaderManager(), httpVersionPolicy);
         CacheManager cacheManager = getCacheManager();
         if (cacheManager != null) {
             cacheManager.setHeaders(url, request);
@@ -317,7 +364,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     }
 
     private static void setConnectionHeaders(org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
-            HeaderManager headerManager) {
+            HeaderManager headerManager, HttpVersionPolicy httpVersionPolicy) {
         if (headerManager == null) {
             return;
         }
@@ -328,7 +375,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         for (JMeterProperty property : headers) {
             org.apache.jmeter.protocol.http.control.Header header =
                     (org.apache.jmeter.protocol.http.control.Header) property.getObjectValue();
-            if (!HTTPConstants.HEADER_CONTENT_LENGTH.equalsIgnoreCase(header.getName())) {
+            if (!HTTPConstants.HEADER_CONTENT_LENGTH.equalsIgnoreCase(header.getName())
+                    && (httpVersionPolicy != HttpVersionPolicy.FORCE_HTTP_2
+                    || !HTTPConstants.HEADER_CONNECTION.equalsIgnoreCase(header.getName()))) {
                 request.addHeader(header.getName(), header.getValue());
             }
         }
@@ -451,9 +500,17 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return clients.computeIfAbsent(key, HTTPHC5Impl::createClient);
     }
 
+    private static CloseableHttpAsyncClient getHttp2Client(HttpClientKey key) {
+        Map<HttpClientKey, CloseableHttpAsyncClient> clients = HTTP_2_CLIENTS.get();
+        return clients.computeIfAbsent(key, HTTPHC5Impl::createHttp2Client);
+    }
+
     private static CloseableHttpClient createClient(HttpClientKey key) {
         org.apache.hc.client5.http.impl.classic.HttpClientBuilder builder = HttpClients.custom().disableAutomaticRetries();
         PoolingHttpClientConnectionManagerBuilder connectionManagerBuilder = PoolingHttpClientConnectionManagerBuilder.create();
+        connectionManagerBuilder.setDefaultTlsConfig(TlsConfig.custom()
+                .setVersionPolicy(key.httpVersionPolicy)
+                .build());
         if (key.dnsCacheManager != null) {
             connectionManagerBuilder.setDnsResolver(createDnsResolver(key.dnsCacheManager));
         }
@@ -464,7 +521,72 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                             .build());
         }
         builder.setConnectionManager(connectionManagerBuilder.build());
-        builder.setRoutePlanner(new DefaultRoutePlanner(null) {
+        builder.setRoutePlanner(createRoutePlanner(key));
+        return builder.disableContentCompression()
+                .addExecInterceptorFirst("response-content-encoding", RESPONSE_CONTENT_ENCODING)
+                .build();
+    }
+
+    private static CloseableHttpAsyncClient createHttp2Client(HttpClientKey key) {
+        H2AsyncClientBuilder builder = HttpAsyncClients.customHttp2()
+                .disableAutomaticRetries()
+                .setTlsStrategy(HTTP_2_TLS_STRATEGY)
+                .setRoutePlanner(createRoutePlanner(key));
+        if (key.dnsCacheManager != null) {
+            builder.setDnsResolver(createDnsResolver(key.dnsCacheManager));
+        }
+        if (key.connectTimeout > 0) {
+            builder.setDefaultConnectionConfig(ConnectionConfig.custom()
+                    .setConnectTimeout(Timeout.ofMilliseconds(key.connectTimeout))
+                    .build());
+        }
+        CloseableHttpAsyncClient asyncClient = builder.build();
+        asyncClient.start();
+        return asyncClient;
+    }
+
+    @SuppressWarnings("deprecation") // SimpleHttpRequest.copy is required for HttpClient 5.3 compatibility
+    private static ClassicHttpResponse executeHttp2(CloseableHttpAsyncClient client,
+            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context)
+            throws IOException {
+        SimpleHttpRequest asyncRequest = SimpleHttpRequest.copy(request);
+        asyncRequest.setConfig(request.getConfig());
+        HttpEntity requestEntity = request.getEntity();
+        if (requestEntity != null) {
+            asyncRequest.setBody(EntityUtils.toByteArray(requestEntity),
+                    requestEntity.getContentType() == null ? ContentType.DEFAULT_BINARY
+                            : ContentType.parse(requestEntity.getContentType()));
+        }
+        Future<SimpleHttpResponse> responseFuture = client.execute(asyncRequest, context, null);
+        try {
+            return createClassicResponse(responseFuture.get(1, java.util.concurrent.TimeUnit.MINUTES));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while executing HTTP/2 request", e);
+        } catch (TimeoutException e) {
+            responseFuture.cancel(true);
+            throw new IOException("Timed out while executing HTTP/2 request", e);
+        } catch (ExecutionException e) {
+            throw new IOException("Could not execute HTTP/2 request", e.getCause());
+        }
+    }
+
+    private static ClassicHttpResponse createClassicResponse(SimpleHttpResponse asyncResponse) {
+        BasicClassicHttpResponse response = new BasicClassicHttpResponse(asyncResponse.getCode(),
+                asyncResponse.getReasonPhrase());
+        response.setVersion(asyncResponse.getVersion());
+        for (Header header : asyncResponse.getHeaders()) {
+            response.addHeader(header);
+        }
+        byte[] responseBody = asyncResponse.getBodyBytes();
+        if (responseBody != null) {
+            response.setEntity(new ByteArrayEntity(responseBody, asyncResponse.getContentType()));
+        }
+        return response;
+    }
+
+    private static DefaultRoutePlanner createRoutePlanner(HttpClientKey key) {
+        return new DefaultRoutePlanner(null) {
             @Override
             protected HttpHost determineProxy(HttpHost target, org.apache.hc.core5.http.protocol.HttpContext context) {
                 return key.hasProxy ? new HttpHost(key.proxyScheme, key.proxyHost, key.proxyPort) : null;
@@ -475,10 +597,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                     org.apache.hc.core5.http.protocol.HttpContext context) {
                 return key.localAddress;
             }
-        });
-        return builder.disableContentCompression()
-                .addExecInterceptorFirst("response-content-encoding", RESPONSE_CONTENT_ENCODING)
-                .build();
+        };
     }
 
     private static org.apache.hc.client5.http.DnsResolver createDnsResolver(DNSCacheManager dnsCacheManager) {
@@ -507,13 +626,21 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         InetAddress localAddress = getIpSourceAddress();
         boolean useDynamicProxy = isDynamicProxy(proxyHost, proxyPort);
         boolean useStaticProxy = isStaticProxy(url.getHost());
+        HttpVersionPolicy httpVersionPolicy = getHttpVersionPolicy(testElement.getHttpVersion(), HTTP_VERSION);
         if (!useDynamicProxy) {
             proxyScheme = PROXY_SCHEME;
             proxyHost = PROXY_HOST;
             proxyPort = PROXY_PORT;
         }
         return new HttpClientKey(url.getProtocol(), url.getAuthority(), useDynamicProxy || useStaticProxy,
-                proxyScheme, proxyHost, proxyPort, proxyUser, proxyPass, connectTimeout, dnsCacheManager, localAddress);
+                proxyScheme, proxyHost, proxyPort, proxyUser, proxyPass, connectTimeout, dnsCacheManager, localAddress,
+                httpVersionPolicy);
+    }
+
+    static HttpVersionPolicy getHttpVersionPolicy(String samplerHttpVersion, String defaultHttpVersion) {
+        String httpVersion = StringUtilities.isBlank(samplerHttpVersion) ? defaultHttpVersion : samplerHttpVersion;
+        return "HTTP/2".equals(httpVersion) || "2".equals(httpVersion)
+                ? HttpVersionPolicy.FORCE_HTTP_2 : HttpVersionPolicy.FORCE_HTTP_1;
     }
 
     @Override
@@ -542,6 +669,11 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             JOrphanUtils.closeQuietly(client);
         }
         clients.clear();
+        Map<HttpClientKey, CloseableHttpAsyncClient> http2Clients = HTTP_2_CLIENTS.get();
+        for (CloseableHttpAsyncClient client : http2Clients.values()) {
+            JOrphanUtils.closeQuietly(client);
+        }
+        http2Clients.clear();
     }
 
     @Override
@@ -566,10 +698,11 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         private final int connectTimeout;
         private final DNSCacheManager dnsCacheManager;
         private final InetAddress localAddress;
+        private final HttpVersionPolicy httpVersionPolicy;
 
         private HttpClientKey(String protocol, String authority, boolean hasProxy, String proxyScheme,
                 String proxyHost, int proxyPort, String proxyUser, String proxyPass, int connectTimeout, DNSCacheManager dnsCacheManager,
-                InetAddress localAddress) {
+                InetAddress localAddress, HttpVersionPolicy httpVersionPolicy) {
             this.protocol = protocol;
             this.authority = authority;
             this.hasProxy = hasProxy;
@@ -581,6 +714,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             this.connectTimeout = connectTimeout;
             this.dnsCacheManager = dnsCacheManager;
             this.localAddress = localAddress;
+            this.httpVersionPolicy = httpVersionPolicy;
         }
 
         @Override
@@ -595,13 +729,14 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                     && Objects.equals(protocol, other.protocol) && Objects.equals(authority, other.authority)
                     && Objects.equals(proxyScheme, other.proxyScheme) && Objects.equals(proxyHost, other.proxyHost)
                     && Objects.equals(proxyUser, other.proxyUser) && Objects.equals(proxyPass, other.proxyPass)
-                    && Objects.equals(dnsCacheManager, other.dnsCacheManager) && Objects.equals(localAddress, other.localAddress);
+                    && Objects.equals(dnsCacheManager, other.dnsCacheManager) && Objects.equals(localAddress, other.localAddress)
+                    && httpVersionPolicy == other.httpVersionPolicy;
         }
 
         @Override
         public int hashCode() {
             return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort, proxyUser, proxyPass, connectTimeout, dnsCacheManager,
-                    localAddress);
+                    localAddress, httpVersionPolicy);
         }
     }
 }
