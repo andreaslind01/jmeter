@@ -245,6 +245,33 @@ public class CacheManager extends ConfigTestElement implements TestStateListener
         }
     }
 
+    /**
+     * Save the Last-Modified, Etag, and Expires headers if the result is
+     * cacheable. Version for Apache HttpClient 5 implementation.
+     *
+     * @param response response to extract header information from
+     * @param res result to decide if result is cacheable
+     */
+    public void saveDetails(org.apache.hc.core5.http.ClassicHttpResponse response, HTTPSampleResult res) {
+        final String varyHeader = getHeader(response, HTTPConstants.VARY);
+        if (isCacheable(res, varyHeader)) {
+            String lastModified = getHeader(response, HTTPConstants.LAST_MODIFIED);
+            String expires = getHeader(response, HTTPConstants.EXPIRES);
+            String etag = getHeader(response, HTTPConstants.ETAG);
+            String cacheControl = getHeader(response, HTTPConstants.CACHE_CONTROL);
+            String date = getHeader(response, HTTPConstants.DATE);
+            if (anyNotBlank(lastModified, expires, etag, cacheControl)) {
+                setCache(lastModified, cacheControl, expires, etag,
+                        res.getUrlAsString(), date, getVaryHeader(varyHeader, asHeaders(res.getRequestHeaders())));
+            }
+        }
+    }
+
+    private static String getHeader(org.apache.hc.core5.http.HttpMessage message, String name) {
+        org.apache.hc.core5.http.Header header = message.getFirstHeader(name);
+        return header == null ? null : header.getValue();
+    }
+
     // helper method to save the cache entry
     private void setCache(String lastModified, String cacheControl, String expires,
             String etag, String url, String date, Map.Entry<String, String> varyHeader) {
@@ -411,6 +438,29 @@ public class CacheManager extends ConfigTestElement implements TestStateListener
     }
 
     /**
+     * Check the cache, and if there is a match, set conditional request headers.
+     *
+     * @param url URL to look up in cache
+     * @param request request where to set the headers
+     */
+    public void setHeaders(URL url, org.apache.hc.core5.http.ClassicHttpRequest request) {
+        CacheEntry entry = getEntry(url.toString(), asHeaders(request.getHeaders()));
+        if (log.isDebugEnabled()) {
+            log.debug("setHeaders for HTTP Method:{}(HC5) URL:{} Entry:{}", request.getMethod(), url, entry);
+        }
+        if (entry != null) {
+            String lastModified = entry.getLastModified();
+            if (lastModified != null) {
+                request.setHeader(HTTPConstants.IF_MODIFIED_SINCE, lastModified);
+            }
+            String etag = entry.getEtag();
+            if (etag != null) {
+                request.setHeader(HTTPConstants.IF_NONE_MATCH, etag);
+            }
+        }
+    }
+
+    /**
      * Check the cache, and if there is a match, set the headers:
      * <ul>
      * <li>If-Modified-Since</li>
@@ -460,6 +510,17 @@ public class CacheManager extends ConfigTestElement implements TestStateListener
         return entryStillValid(url, getEntry(url.toString(), allHeaders));
     }
 
+    /**
+     * Check whether the URL has a valid entry for the supplied HttpClient 5 request headers.
+     *
+     * @param url URL to look up in cache
+     * @param allHeaders request headers
+     * @return {@code true} if the matching entry has not expired
+     */
+    public boolean inCache(URL url, org.apache.hc.core5.http.Header[] allHeaders) {
+        return entryStillValid(url, getEntry(url.toString(), asHeaders(allHeaders)));
+    }
+
     public boolean inCache(URL url, org.apache.jmeter.protocol.http.control.Header[] allHeaders) {
         return entryStillValid(url, getEntry(url.toString(), asHeaders(allHeaders)));
     }
@@ -482,6 +543,14 @@ public class CacheManager extends ConfigTestElement implements TestStateListener
             }
         }
         return result.toArray(new Header[result.size()]);
+    }
+
+    private static Header[] asHeaders(org.apache.hc.core5.http.Header[] allHeaders) {
+        Header[] result = new Header[allHeaders.length];
+        for (int i = 0; i < allHeaders.length; i++) {
+            result[i] = new BasicHeader(allHeaders[i].getName(), allHeaders[i].getValue());
+        }
+        return result;
     }
 
     private static class HeaderAdapter implements Header {
