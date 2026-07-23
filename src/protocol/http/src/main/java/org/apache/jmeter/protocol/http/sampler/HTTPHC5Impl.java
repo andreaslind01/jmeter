@@ -56,12 +56,13 @@ import org.apache.hc.client5.http.entity.InputStreamFactory;
 import org.apache.hc.client5.http.entity.UrlEncodedFormEntity;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
 import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
-import org.apache.hc.client5.http.impl.async.H2AsyncClientBuilder;
+import org.apache.hc.client5.http.impl.async.HttpAsyncClientBuilder;
 import org.apache.hc.client5.http.impl.async.HttpAsyncClients;
 import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.impl.routing.DefaultRoutePlanner;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.client5.http.ssl.ClientTlsStrategyBuilder;
@@ -528,18 +529,23 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     }
 
     private static CloseableHttpAsyncClient createHttp2Client(HttpClientKey key) {
-        H2AsyncClientBuilder builder = HttpAsyncClients.customHttp2()
+        HttpAsyncClientBuilder builder = HttpAsyncClients.custom()
                 .disableAutomaticRetries()
-                .setTlsStrategy(HTTP_2_TLS_STRATEGY)
                 .setRoutePlanner(createRoutePlanner(key));
+        PoolingAsyncClientConnectionManagerBuilder connectionManagerBuilder = PoolingAsyncClientConnectionManagerBuilder.create();
+        connectionManagerBuilder.setTlsStrategy(HTTP_2_TLS_STRATEGY);
+        connectionManagerBuilder.setDefaultTlsConfig(TlsConfig.custom()
+                .setVersionPolicy(key.httpVersionPolicy)
+                .build());
         if (key.dnsCacheManager != null) {
-            builder.setDnsResolver(createDnsResolver(key.dnsCacheManager));
+            connectionManagerBuilder.setDnsResolver(createDnsResolver(key.dnsCacheManager));
         }
         if (key.connectTimeout > 0) {
-            builder.setDefaultConnectionConfig(ConnectionConfig.custom()
+            connectionManagerBuilder.setDefaultConnectionConfig(ConnectionConfig.custom()
                     .setConnectTimeout(Timeout.ofMilliseconds(key.connectTimeout))
                     .build());
         }
+        builder.setConnectionManager(connectionManagerBuilder.build());
         CloseableHttpAsyncClient asyncClient = builder.build();
         asyncClient.start();
         return asyncClient;
