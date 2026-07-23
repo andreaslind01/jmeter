@@ -17,21 +17,35 @@
 
 package org.apache.jmeter.protocol.http.sampler;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.Authenticator;
 import java.net.BindException;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
+import java.net.PasswordAuthentication;
 import java.net.Proxy;
+import java.net.ProxySelector;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLConnection;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Predicate;
 import java.util.zip.GZIPInputStream;
+
+import javax.net.ssl.SSLContext;
 
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.Authorization;
@@ -44,6 +58,7 @@ import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.testelement.property.CollectionProperty;
 import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.util.JMeterUtils;
+import org.apache.jmeter.util.JsseSSLManager;
 import org.apache.jmeter.util.SSLManager;
 import org.apache.jorphan.io.CountingInputStream;
 import org.apache.jorphan.util.StringUtilities;
@@ -59,7 +74,22 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
     private static final boolean OBEY_CONTENT_LENGTH =
         JMeterUtils.getPropDefault("httpsampler.obey_contentlength", false); // $NON-NLS-1$
 
+    private static final String DEFAULT_HTTP_VERSION =
+        JMeterUtils.getPropDefault("httpclient.version", HTTPConstants.HTTP_1_1); // $NON-NLS-1$
+
+    private static final ThreadLocal<Map<HttpClientKey, HttpClient>> HTTP_2_CLIENTS =
+        ThreadLocal.withInitial(HashMap::new);
+
     private static final Logger log = LoggerFactory.getLogger(HTTPJavaImpl.class);
+
+    static boolean isHttp2(String samplerHttpVersion, String defaultHttpVersion) {
+        String httpVersion = StringUtilities.isBlank(samplerHttpVersion) ? defaultHttpVersion : samplerHttpVersion;
+        return "HTTP/2".equalsIgnoreCase(httpVersion) || "2".equalsIgnoreCase(httpVersion); // $NON-NLS-1$ $NON-NLS-2$
+    }
+
+    private boolean isHttp2() {
+        return isHttp2(testElement.getHttpVersion(), DEFAULT_HTTP_VERSION);
+    }
 
     private static final int MAX_CONN_RETRIES =
         JMeterUtils.getPropDefault("http.java.sampler.retries" // $NON-NLS-1$
@@ -501,6 +531,9 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
      */
     @Override
     protected HTTPSampleResult sample(URL url, String method, boolean areFollowingRedirect, int frameDepth) {
+        if (isHttp2()) {
+            return sampleHttp2(url, method, areFollowingRedirect, frameDepth);
+        }
         HttpURLConnection conn = null;
 
         String urlStr = url.toString();
@@ -725,5 +758,394 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
             conn.disconnect();
         }
         return conn != null;
+    }
+
+    private HTTPSampleResult sampleHttp2(URL url, String method, boolean areFollowingRedirect, int frameDepth) {
+        if (log.isDebugEnabled()) {
+            log.debug("Start : sampleHttp2 {}, method {}, followingRedirect {}, depth {}",
+                    url, method, areFollowingRedirect, frameDepth);
+        }
+
+        HTTPSampleResult res = new HTTPSampleResult();
+        configureSampleLabel(res, url);
+        res.setURL(url);
+        res.setHTTPMethod(method);
+
+        res.sampleStart();
+
+        final CacheManager cacheManager = getCacheManager();
+        if (cacheManager != null && HTTPConstants.GET.equalsIgnoreCase(method)) {
+            if (cacheManager.inCache(url, getHeaders(getHeaderManager()))) {
+                return updateSampleResultForResourceInCache(res);
+            }
+        }
+
+        try {
+            CapturingHttpURLConnection capturingConn = new CapturingHttpURLConnection(url, method);
+
+            setConnectionHeaders(capturingConn, url, getHeaderManager(), getCacheManager());
+            String cookies = setConnectionCookie(capturingConn, url, getCookieManager());
+            Map<String, String> securityHeaders = setConnectionAuthorization(capturingConn, url, getAuthManager());
+
+            byte[] requestBodyBytes = new byte[0];
+            if (method.equals(HTTPConstants.POST)) {
+                setPostHeaders(capturingConn);
+                String postBody = sendPostData(capturingConn);
+                res.setQueryString(postBody);
+                requestBodyBytes = capturingConn.getCapturedBytes();
+            } else if (method.equals(HTTPConstants.PUT)) {
+                setPutHeaders(capturingConn);
+                String putBody = sendPutData(capturingConn);
+                res.setQueryString(putBody);
+                requestBodyBytes = capturingConn.getCapturedBytes();
+            }
+
+            res.setRequestHeaders(getAllHeadersExceptCookie(capturingConn, securityHeaders));
+            if (StringUtilities.isNotEmpty(cookies)) {
+                res.setCookies(cookies);
+            } else {
+                res.setCookies(getOnlyCookieFromHeaders(capturingConn, securityHeaders));
+            }
+
+            URI uri = url.toURI();
+            HttpRequest.Builder reqBuilder = HttpRequest.newBuilder(uri);
+
+            if (method.equalsIgnoreCase(HTTPConstants.POST) || method.equalsIgnoreCase(HTTPConstants.PUT)
+                    || method.equalsIgnoreCase(HTTPConstants.PATCH)) {
+                reqBuilder.method(method, HttpRequest.BodyPublishers.ofByteArray(requestBodyBytes));
+            } else if (method.equalsIgnoreCase(HTTPConstants.GET)) {
+                reqBuilder.GET();
+            } else if (method.equalsIgnoreCase(HTTPConstants.DELETE)) {
+                reqBuilder.DELETE();
+            } else {
+                reqBuilder.method(method, HttpRequest.BodyPublishers.noBody());
+            }
+
+            int rto = getResponseTimeout();
+            if (rto > 0) {
+                reqBuilder.timeout(Duration.ofMillis(rto));
+            }
+
+            Map<String, List<String>> props = capturingConn.getRequestProperties();
+            for (Map.Entry<String, List<String>> entry : props.entrySet()) {
+                String headerName = entry.getKey();
+                if (headerName == null || isRestrictedHeader(headerName)) {
+                    continue;
+                }
+                for (String value : entry.getValue()) {
+                    reqBuilder.header(headerName, value);
+                }
+            }
+
+            HttpClient client = getHttpClient(url);
+            HttpRequest httpRequest = reqBuilder.build();
+
+            HttpResponse<InputStream> response = client.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+            res.latencyEnd();
+
+            byte[] responseData = readResponse(response, res);
+
+            res.sampleEnd();
+
+            res.setResponseData(responseData);
+
+            int statusCode = response.statusCode();
+            res.setResponseCode(Integer.toString(statusCode));
+            res.setSuccessful(isSuccessCode(statusCode));
+            res.setResponseMessage(""); // $NON-NLS-1$
+
+            String responseHeaders = getResponseHeaders(response);
+            res.setResponseHeaders(responseHeaders);
+
+            String ct = response.headers().firstValue(HTTPConstants.HEADER_CONTENT_TYPE).orElse(null);
+            if (ct != null) {
+                res.setContentType(ct);
+                res.setEncodingAndType(ct);
+            }
+
+            if (res.isRedirect()) {
+                String location = response.headers().firstValue(HTTPConstants.HEADER_LOCATION).orElse(null);
+                if (location != null) {
+                    res.setRedirectLocation(location);
+                }
+            }
+
+            res.setHeadersSize(
+                    responseHeaders.length()
+                            + StringUtilities.count(responseHeaders, '\n')
+                            + 2);
+
+            if (getAutoRedirects()) {
+                res.setURL(response.uri().toURL());
+            }
+
+            saveConnectionCookies(response, url, getCookieManager());
+
+            if (cacheManager != null) {
+                cacheManager.saveDetails(response, res);
+            }
+
+            res = resultProcessing(areFollowingRedirect, frameDepth, res);
+
+            log.debug("End : sampleHttp2");
+            return res;
+        } catch (Exception e) {
+            if (res.getEndTime() == 0) {
+                res.sampleEnd();
+            }
+            return errorResult(e, res);
+        }
+    }
+
+    private byte[] readResponse(HttpResponse<InputStream> response, SampleResult res) throws IOException {
+        InputStream in = response.body();
+        if (in == null) {
+            return NULL_BA;
+        }
+
+        boolean gzipped = response.headers().firstValue(HTTPConstants.HEADER_CONTENT_ENCODING)
+                .map(HTTPConstants.ENCODING_GZIP::equalsIgnoreCase)
+                .orElse(false);
+
+        long contentLength = response.headers().firstValueAsLong(HTTPConstants.HEADER_CONTENT_LENGTH).orElse(-1L);
+
+        if (contentLength == 0 && OBEY_CONTENT_LENGTH) {
+            log.info("Content-Length: 0, not reading http-body");
+            res.setResponseHeaders(getResponseHeaders(response));
+            res.latencyEnd();
+            return NULL_BA;
+        }
+
+        CountingInputStream instream = new CountingInputStream(in);
+        InputStream stream = gzipped ? new GZIPInputStream(instream) : instream;
+
+        try {
+            byte[] responseData = readResponse(res, stream, contentLength);
+            res.setBodySize(instream.getBytesRead());
+            return responseData;
+        } finally {
+            instream.close();
+        }
+    }
+
+    private static String getResponseHeaders(HttpResponse<?> response) {
+        StringBuilder headerBuf = new StringBuilder();
+        String versionStr = (response.version() == HttpClient.Version.HTTP_2) ? "HTTP/2" : "HTTP/1.1"; // $NON-NLS-1$ $NON-NLS-2$
+        headerBuf.append(versionStr).append(" ").append(response.statusCode()).append("\n"); // $NON-NLS-1$ $NON-NLS-2$
+
+        response.headers().map().forEach((key, values) -> {
+            if (key != null) {
+                for (String val : values) {
+                    headerBuf.append(key).append(": ").append(val).append("\n"); // $NON-NLS-1$ $NON-NLS-2$
+                }
+            }
+        });
+        return headerBuf.toString();
+    }
+
+    private static void saveConnectionCookies(HttpResponse<?> response, URL u, CookieManager cookieManager) {
+        if (cookieManager != null) {
+            List<String> setCookies = response.headers().allValues(HTTPConstants.HEADER_SET_COOKIE);
+            for (String setCookie : setCookies) {
+                cookieManager.addCookieFromHeader(setCookie, u);
+            }
+        }
+    }
+
+    private static boolean isRestrictedHeader(String name) {
+        return HTTPConstants.HEADER_CONNECTION.equalsIgnoreCase(name)
+                || HTTPConstants.HEADER_CONTENT_LENGTH.equalsIgnoreCase(name)
+                || "Host".equalsIgnoreCase(name) // $NON-NLS-1$
+                || "Expect".equalsIgnoreCase(name) // $NON-NLS-1$
+                || "Upgrade".equalsIgnoreCase(name); // $NON-NLS-1$
+    }
+
+    private HttpClient getHttpClient(URL url) {
+        int connectTimeout = getConnectTimeout();
+        String proxyHost = getProxyHost();
+        int proxyPort = getProxyPortInt();
+        String proxyUser = getProxyUser();
+        String proxyPass = getProxyPass();
+        boolean autoRedirects = getAutoRedirects();
+        SSLContext sslContext = null;
+
+        if (HTTPConstants.PROTOCOL_HTTPS.equalsIgnoreCase(url.getProtocol())) {
+            try {
+                SSLManager sslmgr = SSLManager.getInstance();
+                if (sslmgr instanceof JsseSSLManager jsseSSLManager) {
+                    sslContext = jsseSSLManager.getContext();
+                }
+            } catch (Exception e) {
+                log.warn("Problem getting SSLContext for HTTP/2 HttpClient: ", e); // $NON-NLS-1$
+            }
+        }
+
+        HttpClientKey key = new HttpClientKey(connectTimeout, proxyHost, proxyPort,
+                proxyUser, proxyPass, autoRedirects, sslContext);
+
+        return HTTP_2_CLIENTS.get().computeIfAbsent(key, HTTPJavaImpl::createHttpClient);
+    }
+
+    private static HttpClient createHttpClient(HttpClientKey key) {
+        HttpClient.Builder builder = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_2)
+                .followRedirects(key.autoRedirects ? HttpClient.Redirect.NORMAL : HttpClient.Redirect.NEVER);
+
+        if (key.connectTimeout > 0) {
+            builder.connectTimeout(Duration.ofMillis(key.connectTimeout));
+        }
+
+        if (StringUtilities.isNotEmpty(key.proxyHost) && key.proxyPort > 0) {
+            builder.proxy(ProxySelector.of(new InetSocketAddress(key.proxyHost, key.proxyPort)));
+            if (StringUtilities.isNotEmpty(key.proxyUser)) {
+                builder.authenticator(new Authenticator() {
+                    @Override
+                    protected PasswordAuthentication getPasswordAuthentication() {
+                        if (getRequestorType() == RequestorType.PROXY) {
+                            return new PasswordAuthentication(key.proxyUser,
+                                    key.proxyPass != null ? key.proxyPass.toCharArray() : new char[0]);
+                        }
+                        return super.getPasswordAuthentication();
+                    }
+                });
+            }
+        }
+
+        if (key.sslContext != null) {
+            builder.sslContext(key.sslContext);
+        }
+
+        return builder.build();
+    }
+
+    private static class HttpClientKey {
+        private final int connectTimeout;
+        private final String proxyHost;
+        private final int proxyPort;
+        private final String proxyUser;
+        private final String proxyPass;
+        private final boolean autoRedirects;
+        private final SSLContext sslContext;
+
+        HttpClientKey(int connectTimeout, String proxyHost, int proxyPort,
+                      String proxyUser, String proxyPass, boolean autoRedirects,
+                      SSLContext sslContext) {
+            this.connectTimeout = connectTimeout;
+            this.proxyHost = proxyHost;
+            this.proxyPort = proxyPort;
+            this.proxyUser = proxyUser;
+            this.proxyPass = proxyPass;
+            this.autoRedirects = autoRedirects;
+            this.sslContext = sslContext;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof HttpClientKey that)) {
+                return false;
+            }
+            return connectTimeout == that.connectTimeout
+                    && proxyPort == that.proxyPort
+                    && autoRedirects == that.autoRedirects
+                    && Objects.equals(proxyHost, that.proxyHost)
+                    && Objects.equals(proxyUser, that.proxyUser)
+                    && Objects.equals(proxyPass, that.proxyPass)
+                    && Objects.equals(sslContext, that.sslContext);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(connectTimeout, proxyHost, proxyPort, proxyUser, proxyPass, autoRedirects, sslContext);
+        }
+    }
+
+    private static class CapturingHttpURLConnection extends HttpURLConnection {
+        private final Map<String, List<String>> requestProperties = new LinkedHashMap<>();
+        private final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+
+        CapturingHttpURLConnection(URL url, String method) {
+            super(url);
+            this.method = method;
+        }
+
+        @Override
+        public void setRequestProperty(String key, String value) {
+            if (key == null) {
+                return;
+            }
+            List<String> list = new ArrayList<>();
+            list.add(value);
+            requestProperties.put(key, list);
+        }
+
+        @Override
+        public void addRequestProperty(String key, String value) {
+            if (key == null) {
+                return;
+            }
+            requestProperties.computeIfAbsent(key, k -> new ArrayList<>()).add(value);
+        }
+
+        @Override
+        public String getRequestProperty(String key) {
+            if (key == null) {
+                return null;
+            }
+            List<String> values = requestProperties.get(key);
+            if (values == null || values.isEmpty()) {
+                for (Map.Entry<String, List<String>> entry : requestProperties.entrySet()) {
+                    if (key.equalsIgnoreCase(entry.getKey())) {
+                        values = entry.getValue();
+                        break;
+                    }
+                }
+            }
+            return (values != null && !values.isEmpty()) ? values.get(0) : null;
+        }
+
+        @Override
+        public Map<String, List<String>> getRequestProperties() {
+            return Collections.unmodifiableMap(requestProperties);
+        }
+
+        @Override
+        public java.io.OutputStream getOutputStream() throws IOException {
+            return outputStream;
+        }
+
+        byte[] getCapturedBytes() {
+            return outputStream.toByteArray();
+        }
+
+        @Override
+        public void connect() throws IOException {
+        }
+
+        @Override
+        public void disconnect() {
+        }
+
+        @Override
+        public boolean usingProxy() {
+            return false;
+        }
+
+        @Override
+        public String getHeaderField(int n) {
+            return null;
+        }
+
+        @Override
+        public String getHeaderFieldKey(int n) {
+            return null;
+        }
+
+        @Override
+        public String getHeaderField(String name) {
+            return null;
+        }
     }
 }

@@ -1,0 +1,100 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to you under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.jmeter.protocol.http.sampler;
+
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.net.URL;
+
+import org.apache.jmeter.protocol.http.util.HTTPConstants;
+import org.junit.jupiter.api.Test;
+
+import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+
+class TestHTTPJavaFeatures {
+
+    @Test
+    void usesHttpClientVersionWhenSamplerVersionIsEmpty() {
+        assertTrue(HTTPJavaImpl.isHttp2("", "HTTP/2"));
+        assertFalse(HTTPJavaImpl.isHttp2("", "HTTP/1.1"));
+    }
+
+    @Test
+    void usesSamplerHttpVersionWhenSpecified() {
+        assertFalse(HTTPJavaImpl.isHttp2("HTTP/1.1", "HTTP/2"));
+        assertTrue(HTTPJavaImpl.isHttp2("HTTP/2", "HTTP/1.1"));
+    }
+
+    @Test
+    void defaultsToHttp11ForUnsupportedHttpVersion() {
+        assertFalse(HTTPJavaImpl.isHttp2("HTTP/3", "HTTP/2"));
+    }
+
+    @Test
+    void usesHttp2WhenSelected() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/http2")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/http2")), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode());
+            assertEquals("HTTP/2", result.getResponseHeaders().substring(0, "HTTP/2".length()));
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void usesHttp2WithProxy() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/http2proxy")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+            sampler.setProxyHost("localhost");
+            sampler.setProxyPortInt(Integer.toString(server.port()));
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/http2proxy")), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode());
+        } finally {
+            server.stop();
+        }
+    }
+
+    private static HTTPSamplerBase newSampler() {
+        return HTTPSamplerFactory.newInstance("Java");
+    }
+
+    private static WireMockServer createServer() {
+        return new WireMockServer(WireMockConfiguration.wireMockConfig().dynamicPort());
+    }
+}
