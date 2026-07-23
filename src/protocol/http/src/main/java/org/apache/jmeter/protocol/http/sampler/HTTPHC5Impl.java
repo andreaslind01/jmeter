@@ -30,12 +30,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
+import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.entity.UrlEncodedFormEntity;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
-import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
@@ -83,10 +85,10 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     protected HTTPSampleResult sample(URL url, String method, boolean areFollowingRedirect, int frameDepth) {
         HTTPSampleResult result = createSampleResult(url, method);
         org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request = null;
-        CloseableHttpResponse response = null;
+        ClassicHttpResponse response = null;
         try {
             resetStateIfNeeded();
-            request = createRequest(url.toURI(), method, areFollowingRedirect);
+            request = createRequest(url.toURI(), method);
             setupRequest(url, request, result, areFollowingRedirect);
             result.sampleStart();
 
@@ -96,7 +98,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             }
 
             currentRequest = request;
-            response = getClient(createHttpClientKey(url)).execute(request);
+            response = getClient(createHttpClientKey(url)).executeOpen(null, request, null);
             result.sampleEnd();
             currentRequest = null;
 
@@ -125,8 +127,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return result;
     }
 
-    private org.apache.hc.client5.http.classic.methods.HttpUriRequestBase createRequest(
-            URI uri, String method, boolean areFollowingRedirect) {
+    private static org.apache.hc.client5.http.classic.methods.HttpUriRequestBase createRequest(URI uri, String method) {
         return new org.apache.hc.client5.http.classic.methods.HttpUriRequestBase(method, uri);
     }
 
@@ -138,14 +139,10 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         if (responseTimeout > 0) {
             config.setResponseTimeout(Timeout.ofMilliseconds(responseTimeout));
         }
-        int connectTimeout = getConnectTimeout();
-        if (connectTimeout > 0) {
-            config.setConnectTimeout(Timeout.ofMilliseconds(connectTimeout));
-        }
         request.setConfig(config.build());
         request.setHeader(HTTPConstants.HEADER_CONNECTION,
                 getUseKeepAlive() ? HTTPConstants.KEEP_ALIVE : HTTPConstants.CONNECTION_CLOSE);
-        setConnectionHeaders(request, url, getHeaderManager());
+        setConnectionHeaders(request, getHeaderManager());
 
         String cookies = setConnectionCookie(request, url, getCookieManager());
         if (StringUtilities.isNotEmpty(cookies)) {
@@ -240,7 +237,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     }
 
     private static void setConnectionHeaders(org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
-            URL url, HeaderManager headerManager) {
+            HeaderManager headerManager) {
         if (headerManager == null) {
             return;
         }
@@ -269,7 +266,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return cookies;
     }
 
-    private void updateResult(CloseableHttpResponse response,
+    private void updateResult(ClassicHttpResponse response,
             org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HTTPSampleResult result) throws IOException {
         result.setRequestHeaders(getRequestHeaders(request));
         Header contentType = response.getFirstHeader(HTTPConstants.HEADER_CONTENT_TYPE);
@@ -299,7 +296,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         }
     }
 
-    private static String getResponseHeaders(CloseableHttpResponse response) {
+    private static String getResponseHeaders(ClassicHttpResponse response) {
         StringBuilder headers = new StringBuilder();
         headers.append(response.getVersion()).append(' ').append(response.getCode()).append(' ')
                 .append(response.getReasonPhrase()).append('\n');
@@ -324,7 +321,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return cookie == null ? "" : cookie.getValue();
     }
 
-    private static void saveConnectionCookies(CloseableHttpResponse response, URL url, CookieManager cookieManager) {
+    private static void saveConnectionCookies(ClassicHttpResponse response, URL url, CookieManager cookieManager) {
         if (cookieManager == null) {
             return;
         }
@@ -333,13 +330,20 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         }
     }
 
-    private CloseableHttpClient getClient(HttpClientKey key) {
+    private static CloseableHttpClient getClient(HttpClientKey key) {
         Map<HttpClientKey, CloseableHttpClient> clients = HTTP_CLIENTS.get();
-        return clients.computeIfAbsent(key, this::createClient);
+        return clients.computeIfAbsent(key, HTTPHC5Impl::createClient);
     }
 
-    private CloseableHttpClient createClient(HttpClientKey key) {
+    private static CloseableHttpClient createClient(HttpClientKey key) {
         org.apache.hc.client5.http.impl.classic.HttpClientBuilder builder = HttpClients.custom().disableAutomaticRetries();
+        if (key.connectTimeout > 0) {
+            builder.setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create()
+                    .setDefaultConnectionConfig(ConnectionConfig.custom()
+                            .setConnectTimeout(Timeout.ofMilliseconds(key.connectTimeout))
+                            .build())
+                    .build());
+        }
         if (key.hasProxy) {
             builder.setProxy(new HttpHost(key.proxyScheme, key.proxyHost, key.proxyPort));
         }
@@ -350,6 +354,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         String proxyScheme = getProxyScheme();
         String proxyHost = getProxyHost();
         int proxyPort = getProxyPortInt();
+        int connectTimeout = getConnectTimeout();
         boolean useDynamicProxy = isDynamicProxy(proxyHost, proxyPort);
         boolean useStaticProxy = isStaticProxy(url.getHost());
         if (!useDynamicProxy) {
@@ -358,7 +363,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             proxyPort = PROXY_PORT;
         }
         return new HttpClientKey(url.getProtocol(), url.getAuthority(), useDynamicProxy || useStaticProxy,
-                proxyScheme, proxyHost, proxyPort);
+                proxyScheme, proxyHost, proxyPort, connectTimeout);
     }
 
     @Override
@@ -368,7 +373,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 && RESET_STATE_ON_THREAD_GROUP_ITERATION);
     }
 
-    private void resetStateIfNeeded() {
+    private static void resetStateIfNeeded() {
         if (resetStateOnThreadGroupIteration.get()) {
             closeThreadLocalClients();
             ((JsseSSLManager) SSLManager.getInstance()).resetContext();
@@ -406,15 +411,17 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         private final String proxyScheme;
         private final String proxyHost;
         private final int proxyPort;
+        private final int connectTimeout;
 
         private HttpClientKey(String protocol, String authority, boolean hasProxy, String proxyScheme,
-                String proxyHost, int proxyPort) {
+                String proxyHost, int proxyPort, int connectTimeout) {
             this.protocol = protocol;
             this.authority = authority;
             this.hasProxy = hasProxy;
             this.proxyScheme = proxyScheme;
             this.proxyHost = proxyHost;
             this.proxyPort = proxyPort;
+            this.connectTimeout = connectTimeout;
         }
 
         @Override
@@ -425,14 +432,14 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             if (!(object instanceof HttpClientKey other)) {
                 return false;
             }
-            return hasProxy == other.hasProxy && proxyPort == other.proxyPort
+            return hasProxy == other.hasProxy && proxyPort == other.proxyPort && connectTimeout == other.connectTimeout
                     && Objects.equals(protocol, other.protocol) && Objects.equals(authority, other.authority)
                     && Objects.equals(proxyScheme, other.proxyScheme) && Objects.equals(proxyHost, other.proxyHost);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort);
+            return Objects.hash(protocol, authority, hasProxy, proxyScheme, proxyHost, proxyPort, connectTimeout);
         }
     }
 }
