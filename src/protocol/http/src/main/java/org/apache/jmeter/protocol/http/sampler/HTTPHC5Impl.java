@@ -212,7 +212,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             currentRequest = request;
             HttpClientKey clientKey = createHttpClientKey(url);
             HttpClientContext context = createHttpClientContext(url, clientKey, request);
-            response = clientKey.httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_2
+            response = clientKey.httpVersionPolicy != HttpVersionPolicy.FORCE_HTTP_1
                     ? executeHttp2(getHttp2Client(clientKey), request, context)
                     : getClient(clientKey).executeOpen(null, request, context);
             result.sampleEnd();
@@ -263,7 +263,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         if (httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_1) {
             request.setHeader(HTTPConstants.HEADER_CONNECTION,
                     getUseKeepAlive() ? HTTPConstants.KEEP_ALIVE : HTTPConstants.CONNECTION_CLOSE);
-        } else {
+        } else if (httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_2) {
             request.setVersion(HttpVersion.HTTP_2);
         }
         setConnectionHeaders(request, getHeaderManager(), httpVersionPolicy);
@@ -377,7 +377,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             org.apache.jmeter.protocol.http.control.Header header =
                     (org.apache.jmeter.protocol.http.control.Header) property.getObjectValue();
             if (!HTTPConstants.HEADER_CONTENT_LENGTH.equalsIgnoreCase(header.getName())
-                    && (httpVersionPolicy != HttpVersionPolicy.FORCE_HTTP_2
+                    && (httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_1
                     || !HTTPConstants.HEADER_CONNECTION.equalsIgnoreCase(header.getName()))) {
                 request.addHeader(header.getName(), header.getValue());
             }
@@ -646,7 +646,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     static HttpVersionPolicy getHttpVersionPolicy(String samplerHttpVersion, String defaultHttpVersion) {
         String httpVersion = StringUtilities.isBlank(samplerHttpVersion) ? defaultHttpVersion : samplerHttpVersion;
         return "HTTP/2".equals(httpVersion) || "2".equals(httpVersion)
-                ? HttpVersionPolicy.FORCE_HTTP_2 : HttpVersionPolicy.FORCE_HTTP_1;
+                ? HttpVersionPolicy.NEGOTIATE : HttpVersionPolicy.FORCE_HTTP_1;
     }
 
     @Override

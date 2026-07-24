@@ -45,13 +45,13 @@ class TestHTTPHC5Features {
 
     @Test
     void usesHttpClientVersionWhenSamplerVersionIsEmpty() {
-        assertEquals(HttpVersionPolicy.FORCE_HTTP_2, HTTPHC5Impl.getHttpVersionPolicy("", "HTTP/2"));
+        assertEquals(HttpVersionPolicy.NEGOTIATE, HTTPHC5Impl.getHttpVersionPolicy("", "HTTP/2"));
     }
 
     @Test
     void usesSamplerHttpVersionWhenSpecified() {
         assertEquals(HttpVersionPolicy.FORCE_HTTP_1, HTTPHC5Impl.getHttpVersionPolicy("HTTP/1.1", "HTTP/2"));
-        assertEquals(HttpVersionPolicy.FORCE_HTTP_2, HTTPHC5Impl.getHttpVersionPolicy("HTTP/2", "HTTP/1.1"));
+        assertEquals(HttpVersionPolicy.NEGOTIATE, HTTPHC5Impl.getHttpVersionPolicy("HTTP/2", "HTTP/1.1"));
     }
 
     @Test
@@ -91,6 +91,27 @@ class TestHTTPHC5Features {
 
             assertEquals("200", result.getResponseCode());
             assertEquals("HTTP/2", result.getResponseHeaders().substring(0, "HTTP/2".length()));
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void fallsBackToHttp11WhenServerDoesNotSupportHttp2() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(true));
+        try {
+            server.start();
+            server.stubFor(get(urlEqualTo("/fallback")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("https://localhost:" + server.httpsPort() + "/fallback"), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode());
+            assertEquals("HTTP/1.1", result.getResponseHeaders().substring(0, "HTTP/1.1".length()));
         } finally {
             server.stop();
         }
