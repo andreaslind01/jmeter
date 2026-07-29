@@ -1552,6 +1552,12 @@ JMETER-SERVER</source>
     Can be switched off by setting the value to <code>-1</code>.<br/>
     Defaults to: <code>10000</code>
 </property>
+<property name="view.results.tree.request.simple_view_limit">
+    Configures maximum length of the raw request data before switching to a simpler view, that does not do line breaks,
+    instead of the syntax highlighting text area.<br/>
+    Can be switched off by setting the value to <code>-1</code>.<br/>
+    Defaults to: <code>10000</code>
+</property>
 <property name="document.max_size">
     Maximum size (in bytes) of Document that can be parsed by Tika engine<br/>
     Set to zero to disable the size check.<br/>
