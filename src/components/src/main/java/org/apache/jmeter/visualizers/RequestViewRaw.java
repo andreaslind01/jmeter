@@ -19,6 +19,7 @@ package org.apache.jmeter.visualizers;
 
 import java.awt.BorderLayout;
 
+import javax.swing.JEditorPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
@@ -28,6 +29,7 @@ import org.apache.jmeter.gui.util.JSyntaxTextArea;
 import org.apache.jmeter.gui.util.JTextScrollPane;
 import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.util.JMeterUtils;
+import org.apache.jmeter.visualizers.SearchTextExtension.JEditorPaneSearchProvider;
 import org.apache.jorphan.gui.GuiUtils;
 import org.apache.jorphan.util.StringUtilities;
 
@@ -44,7 +46,7 @@ public class RequestViewRaw implements RequestView {
     static final String KEY_LABEL = "view_results_table_request_tab_raw"; //$NON-NLS-1$
 
     private JSyntaxTextArea headerData;
-    private JSyntaxTextArea sampleDataField;
+    private JEditorPane sampleDataField;
 
     private JPanel paneRaw; /** request pane content */
 
@@ -52,13 +54,12 @@ public class RequestViewRaw implements RequestView {
     public void init() {
         paneRaw = new JPanel(new BorderLayout(0, 5));
 
-        sampleDataField = JSyntaxTextArea.getInstance(20, 80, true);
+        sampleDataField = new JEditorPane();
         sampleDataField.setEditable(false);
-        sampleDataField.setLineWrap(true);
-        sampleDataField.setWrapStyleWord(true);
         JPanel requestAndSearchPanel = new JPanel(new BorderLayout());
-        requestAndSearchPanel.add(new JSyntaxSearchToolBar(sampleDataField).getToolBar(), BorderLayout.NORTH);
-        requestAndSearchPanel.add(JTextScrollPane.getInstance(sampleDataField), BorderLayout.CENTER);
+        SearchTextExtension searchTextExtension = new SearchTextExtension(new JEditorPaneSearchProvider(sampleDataField));
+        requestAndSearchPanel.add(searchTextExtension.getSearchToolBar(), BorderLayout.NORTH);
+        requestAndSearchPanel.add(GuiUtils.makeScrollPane(sampleDataField), BorderLayout.CENTER);
 
         headerData = JSyntaxTextArea.getInstance(20, 80, true);
         headerData.setEditable(false);
@@ -77,7 +78,7 @@ public class RequestViewRaw implements RequestView {
 
     @Override
     public void clearData() {
-        sampleDataField.setInitialText(""); //$NON-NLS-1$
+        sampleDataField.setText(""); //$NON-NLS-1$
         headerData.setInitialText(""); //$NON-NLS-1$
     }
 
