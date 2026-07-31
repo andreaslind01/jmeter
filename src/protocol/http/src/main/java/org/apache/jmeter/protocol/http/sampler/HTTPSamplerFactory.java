@@ -43,6 +43,8 @@ public final class HTTPSamplerFactory {
     public static final String IMPL_HTTP_CLIENT3_1 = "HttpClient3.1"; // $NON-NLS-1$
 
     public static final String IMPL_JAVA = "Java"; // $NON-NLS-1$
+
+    public static final String IMPL_OK_HTTP = "OkHttp"; // $NON-NLS-1$
     //- JMX
 
     public static final String DEFAULT_CLASSNAME =
@@ -81,11 +83,14 @@ public final class HTTPSamplerFactory {
         if (alias.equals(IMPL_HTTP_CLIENT5)) {
             return new HTTPSamplerProxy(IMPL_HTTP_CLIENT5);
         }
+        if (alias.equals(IMPL_OK_HTTP)) {
+            return new HTTPSamplerProxy(IMPL_OK_HTTP);
+        }
         throw new IllegalArgumentException("Unknown sampler type: '" + alias+"'");
     }
 
     public static String[] getImplementations(){
-        return new String[]{IMPL_HTTP_CLIENT4, IMPL_HTTP_CLIENT5, IMPL_JAVA};
+        return new String[]{IMPL_HTTP_CLIENT4, IMPL_HTTP_CLIENT5, IMPL_JAVA, IMPL_OK_HTTP};
     }
 
     public static HTTPAbstractImpl getImplementation(String impl, HTTPSamplerBase base){
@@ -101,6 +106,8 @@ public final class HTTPSamplerFactory {
             return new HTTPHC4Impl(base);
         } else if (IMPL_HTTP_CLIENT5.equals(impl)) {
             return new HTTPHC5Impl(base);
+        } else if (IMPL_OK_HTTP.equals(impl)) {
+            return new HTTPOkImpl(base);
         } else {
             throw new IllegalArgumentException("Unknown implementation type: '"+impl+"'");
         }

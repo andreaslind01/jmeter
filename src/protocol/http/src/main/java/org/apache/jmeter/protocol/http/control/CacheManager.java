@@ -29,6 +29,8 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 import org.apache.http.Header;
 import org.apache.http.HeaderElement;
@@ -294,6 +296,29 @@ public class CacheManager extends ConfigTestElement implements TestStateListener
         return header == null ? null : header.getValue();
     }
 
+    /**
+     * Save the Last-Modified, Etag, and Expires headers if the result is cacheable.
+     * Library neutral version, the headers of the response are read through {@code headerLookup}.
+     *
+     * @param headerLookup returns the first value of the response header with the given (case insensitive) name,
+     *                     or {@code null} when the response does not contain the header
+     * @param res result to decide if result is cacheable
+     */
+    public void saveDetails(Function<String, String> headerLookup, HTTPSampleResult res) {
+        final String varyHeader = headerLookup.apply(HTTPConstants.VARY);
+        if (isCacheable(res, varyHeader)) {
+            String lastModified = headerLookup.apply(HTTPConstants.LAST_MODIFIED);
+            String expires = headerLookup.apply(HTTPConstants.EXPIRES);
+            String etag = headerLookup.apply(HTTPConstants.ETAG);
+            String cacheControl = headerLookup.apply(HTTPConstants.CACHE_CONTROL);
+            String date = headerLookup.apply(HTTPConstants.DATE);
+            if (anyNotBlank(lastModified, expires, etag, cacheControl)) {
+                setCache(lastModified, cacheControl, expires, etag,
+                        res.getUrlAsString(), date, getVaryHeader(varyHeader, asHeaders(res.getRequestHeaders())));
+            }
+        }
+    }
+
     // helper method to save the cache entry
     private void setCache(String lastModified, String cacheControl, String expires,
             String etag, String url, String date, Map.Entry<String, String> varyHeader) {
@@ -507,6 +532,37 @@ public class CacheManager extends ConfigTestElement implements TestStateListener
             final String etag = entry.getEtag();
             if (etag != null){
                 conn.addRequestProperty(HTTPConstants.IF_NONE_MATCH, etag);
+            }
+        }
+    }
+
+    /**
+     * Check the cache, and if there is a match, set the headers:
+     * <ul>
+     * <li>If-Modified-Since</li>
+     * <li>If-None-Match</li>
+     * </ul>
+     * Library neutral version, the headers are applied through {@code headerSetter}.
+     *
+     * @param url {@link URL} to look up in cache
+     * @param requestHeaders headers of the request that is about to be sent
+     * @param headerSetter receives the name and the value of every conditional header to set
+     */
+    public void setHeaders(URL url, org.apache.jmeter.protocol.http.control.Header[] requestHeaders,
+            BiConsumer<String, String> headerSetter) {
+        CacheEntry entry = getEntry(url.toString(),
+                requestHeaders != null ? asHeaders(requestHeaders) : new Header[0]);
+        if (log.isDebugEnabled()) {
+            log.debug("setHeaders url:{} entry:{}", url, entry);
+        }
+        if (entry != null) {
+            final String lastModified = entry.getLastModified();
+            if (lastModified != null) {
+                headerSetter.accept(HTTPConstants.IF_MODIFIED_SINCE, lastModified);
+            }
+            final String etag = entry.getEtag();
+            if (etag != null) {
+                headerSetter.accept(HTTPConstants.IF_NONE_MATCH, etag);
             }
         }
     }

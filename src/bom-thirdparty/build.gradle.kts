@@ -58,6 +58,8 @@ dependencies {
         api("com.jayway.jsonpath:json-path:2.10.0")
         api("com.miglayout:miglayout-core:11.4.3")
         api("com.miglayout:miglayout-swing:11.4.3")
+        api("com.squareup.okhttp3:okhttp:4.12.0")
+        api("com.squareup.okio:okio:3.6.0")
         api("com.sun.activation:javax.activation:1.2.0")
         api("com.thoughtworks.xstream:xstream:1.4.21")
         api("commons-codec:commons-codec:1.20.0")

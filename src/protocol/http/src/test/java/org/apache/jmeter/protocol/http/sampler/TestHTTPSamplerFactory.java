@@ -39,6 +39,16 @@ public class TestHTTPSamplerFactory {
     }
 
     @Test
+    void okHttpIsSelectable() {
+        assertTrue(Arrays.asList(HTTPSamplerFactory.getImplementations()).contains("OkHttp"));
+
+        HTTPSamplerBase sampler = HTTPSamplerFactory.newInstance("OkHttp");
+
+        assertEquals("OkHttp", sampler.getImplementation());
+        assertInstanceOf(HTTPOkImpl.class, HTTPSamplerFactory.getImplementation(sampler.getImplementation(), sampler));
+    }
+
+    @Test
     void unknownImplementationIsRejected() {
         assertThrows(IllegalArgumentException.class, () -> HTTPSamplerFactory.newInstance("HttpClient6"));
     }

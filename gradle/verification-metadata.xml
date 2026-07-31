@@ -12,6 +12,9 @@
          <trust group="gradle" name="gradle"/>
          <trust file=".*-javadoc[.]jar" regex="true"/>
          <trust file=".*-sources[.]jar" regex="true"/>
+         <trust group="^com[.]squareup[.]okhttp3($|([.].*))" regex="true"/>
+         <trust group="^com[.]squareup[.]okio($|([.].*))" regex="true"/>
+         <trust group="^org[.]jetbrains[.]kotlin($|([.].*))" regex="true"/>
       </trusted-artifacts>
       <trusted-keys>
          <trusted-key id="015479E1055341431B4545AB72475FD306B9CAB7" group="com.googlecode.javaewah"/>
