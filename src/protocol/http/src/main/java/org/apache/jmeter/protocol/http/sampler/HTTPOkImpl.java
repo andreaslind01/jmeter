@@ -91,7 +91,7 @@ import okio.Okio;
 import okio.Source;
 
 /**
- * HTTP Sampler using OkHttp 4.x.
+ * HTTP Sampler using OkHttp 5.x.
  */
 public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
