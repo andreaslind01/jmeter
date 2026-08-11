@@ -107,6 +107,8 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     private static final String DISABLE_DEFAULT_UA_PROPERTY = "okhttp.default_user_agent_disabled";
 
+    private static final String RETRY_ON_CONNECTION_FAILURE_PROPERTY = "okhttp.retry_on_connection_failure";
+
     private static final String DEFAULT_USER_AGENT = "OkHttp/" + OkHttp.VERSION;
 
     private static final boolean HTTP_2_PRIOR_KNOWLEDGE =
@@ -531,12 +533,20 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         return JMeterUtils.getPropDefault(DISABLE_DEFAULT_UA_PROPERTY, false);
     }
 
+    private static boolean isRetryOnConnectionFailureEnabled() {
+        return JMeterUtils.getPropDefault(RETRY_ON_CONNECTION_FAILURE_PROPERTY, false);
+    }
+
     private static OkHttpClient createClient(HttpClientKey key) {
         OkHttpClient.Builder builder = new OkHttpClient.Builder();
         builder.addInterceptor(DECOMPRESSION_INTERCEPTOR);
         builder.eventListener(CONNECT_TIME_LISTENER);
         builder.followRedirects(key.autoRedirects);
         builder.followSslRedirects(key.autoRedirects);
+        // JMeter must report what the server actually did, so by default transparent retries of
+        // failed connections (and of 408 responses) are disabled, just like disableAutomaticRetries()
+        // in the HttpClient based implementations.
+        builder.retryOnConnectionFailure(isRetryOnConnectionFailureEnabled());
 
         if (key.connectTimeout > 0) {
             builder.connectTimeout(key.connectTimeout, TimeUnit.MILLISECONDS);

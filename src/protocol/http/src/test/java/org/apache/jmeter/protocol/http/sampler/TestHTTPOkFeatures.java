@@ -28,9 +28,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.net.URL;
 import java.util.List;
 
+import org.apache.jmeter.junit.JMeterTestCase;
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.CacheManager;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
+import org.apache.jmeter.util.JMeterUtils;
 import org.junit.jupiter.api.Test;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -39,7 +41,9 @@ import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 
 import okhttp3.Protocol;
 
-class TestHTTPOkFeatures {
+class TestHTTPOkFeatures extends JMeterTestCase {
+
+    private static final String RETRY_PROPERTY = "okhttp.retry_on_connection_failure";
 
     @Test
     void usesSamplerHttpVersionWhenSpecified() {
@@ -242,6 +246,49 @@ class TestHTTPOkFeatures {
             assertTrue(result.getConnectTime() <= result.getTime(),
                     "connectTime should not exceed the elapsed time");
         } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void doesNotRetryClientTimeoutResponses() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/retry408")).willReturn(aResponse().withStatus(408)));
+            HTTPSamplerBase sampler = newSampler();
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/retry408")), HTTPConstants.GET, false, 1);
+
+            assertEquals("408", result.getResponseCode());
+            server.verify(1, getRequestedFor(urlEqualTo("/retry408")));
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void retriesClientTimeoutResponsesWhenConfigured() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        String oldValue = JMeterUtils.getProperty(RETRY_PROPERTY);
+        JMeterUtils.setProperty(RETRY_PROPERTY, "true");
+        try {
+            server.stubFor(get(urlEqualTo("/retry408")).willReturn(aResponse().withStatus(408)));
+            HTTPSamplerBase sampler = newSampler();
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/retry408")), HTTPConstants.GET, false, 1);
+
+            assertEquals("408", result.getResponseCode());
+            server.verify(2, getRequestedFor(urlEqualTo("/retry408")));
+        } finally {
+            if (oldValue == null) {
+                JMeterUtils.getJMeterProperties().remove(RETRY_PROPERTY);
+            } else {
+                JMeterUtils.setProperty(RETRY_PROPERTY, oldValue);
+            }
             server.stop();
         }
     }

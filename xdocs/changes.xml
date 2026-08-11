@@ -95,6 +95,7 @@ Summary
     <li>Multiplex concurrent HTTP/2 requests of the Java sampler implementation over a single connection, and make the HTTP/2 protocol settings (HPACK header table size, maximum concurrent streams, flow control windows, maximum frame size, connection keep alive and server push) configurable with the new <code>http.java.h2.*</code> properties.</li>
     <li>Add the default <code>User-Agent</code> header of the HttpClient5 sampler implementation to the request itself, so it shows up in the sample result and in the sent bytes, and allow suppressing it with the new <code>httpclient5.default_user_agent_disabled</code> property, like <code>httpclient4.default_user_agent_disabled</code> does for HttpClient4.</li>
     <li>Add the default <code>User-Agent</code> header of the Java sampler implementation (<code>Java/A.B.C</code> for HTTP/1.1 and <code>Java-http-client/A.B.C</code> for HTTP/2) to the request itself, so the header the JDK sends anyway shows up in the sample result and in the sent bytes.</li>
+    <li>Disable the transparent retries of the OkHttp sampler implementation (retrying a recoverable connection failure on a new connection and repeating requests answered with <code>408</code>), so the sample result reports the actual server behavior and timing, like <code>disableAutomaticRetries()</code> does for the HttpClient based implementations. The previous behavior can be restored with the new <code>okhttp.retry_on_connection_failure</code> property.</li>
   </ul>
 
   <h3>Timers, Assertions, Config, Pre- &amp; Post-Processors</h3>
