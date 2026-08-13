@@ -33,6 +33,8 @@ import java.net.URL;
 import java.util.Base64;
 import java.util.List;
 
+import javax.security.auth.Subject;
+
 import org.apache.jmeter.junit.JMeterTestCase;
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.CacheManager;
@@ -44,6 +46,7 @@ import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 
+import okhttp3.Credentials;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
@@ -446,6 +449,101 @@ class TestHTTPOkFeatures extends JMeterTestCase {
 
         assertEquals("kerberos.example.invalid", SpnegoAuthenticator.getAuthServer(url, true));
         assertEquals("kerberos.example.invalid:8080", SpnegoAuthenticator.getAuthServer(url, false));
+    }
+
+    @Test
+    void answersNegotiateProxyChallengeWithASpnegoToken() throws Exception {
+        Request request = new Request.Builder().url("http://target.example.invalid/resource").build();
+        SpnegoProxyAuthenticator authenticator = new SpnegoProxyAuthenticator("proxy.example.invalid", 8080,
+                "", "", (authServer, input) -> ("token-for-" + authServer).getBytes(UTF_8));
+
+        Request retry = authenticator.authenticate(null, proxyAuthenticationRequiredResponse(request, "Negotiate"));
+
+        assertNotNull(retry, "the challenge of the proxy has to be answered");
+        assertEquals("Negotiate " + Base64.getEncoder()
+                        .encodeToString("token-for-proxy.example.invalid".getBytes(UTF_8)),
+                retry.header("Proxy-Authorization"),
+                "the SPNEGO token has to be built for the proxy, not for the target");
+    }
+
+    @Test
+    void prefersTheConfiguredProxyCredentialsOverNegotiate() throws Exception {
+        Request request = new Request.Builder().url("http://target.example.invalid/resource").build();
+        SpnegoProxyAuthenticator authenticator = new SpnegoProxyAuthenticator("proxy.example.invalid", 8080,
+                "user", "pass", (authServer, input) -> ("token-for-" + authServer).getBytes(UTF_8));
+
+        Request retry = authenticator.authenticate(null, proxyAuthenticationRequiredResponse(request, "Negotiate"));
+
+        assertNotNull(retry, "the challenge of the proxy has to be answered");
+        assertEquals(Credentials.basic("user", "pass"), retry.header("Proxy-Authorization"),
+                "a proxy with configured credentials must not switch to Kerberos");
+    }
+
+    @Test
+    void usesTheProxySubjectOfTheAuthorizationManagerForNegotiate() throws Exception {
+        Request request = new Request.Builder().url("http://target.example.invalid/resource").build();
+        SpnegoProxyAuthenticator authenticator = new SpnegoProxyAuthenticator("proxy.example.invalid", 8080,
+                "user", "pass", (authServer, input) -> ("token-for-" + authServer).getBytes(UTF_8));
+        SpnegoProxyAuthenticator.setSubject(new Subject());
+        try {
+            Request retry = authenticator.authenticate(null, proxyAuthenticationRequiredResponse(request, "Negotiate"));
+
+            assertNotNull(retry, "the challenge of the proxy has to be answered");
+            assertEquals("Negotiate " + Base64.getEncoder()
+                            .encodeToString("token-for-proxy.example.invalid".getBytes(UTF_8)),
+                    retry.header("Proxy-Authorization"),
+                    "a Kerberos entry of the authorization manager has to win over the proxy password");
+        } finally {
+            SpnegoProxyAuthenticator.clearSubject();
+        }
+    }
+
+    @Test
+    void doesNotRepeatRejectedProxyCredentials() throws Exception {
+        Request request = new Request.Builder()
+                .url("http://target.example.invalid/resource")
+                .header("Proxy-Authorization", "Negotiate token")
+                .build();
+        SpnegoProxyAuthenticator authenticator = new SpnegoProxyAuthenticator("proxy.example.invalid", 8080,
+                "", "", (authServer, input) -> ("token-for-" + authServer).getBytes(UTF_8));
+
+        assertNull(authenticator.authenticate(null, proxyAuthenticationRequiredResponse(request, "Negotiate")),
+                "a rejected token must not be sent again to avoid an endless loop");
+    }
+
+    @Test
+    void ignoresProxyChallengesWithoutCredentials() throws Exception {
+        Request request = new Request.Builder().url("http://target.example.invalid/resource").build();
+        SpnegoProxyAuthenticator authenticator = new SpnegoProxyAuthenticator("proxy.example.invalid", 8080,
+                "", "", (authServer, input) -> ("token-for-" + authServer).getBytes(UTF_8));
+
+        assertNull(authenticator.authenticate(null,
+                        proxyAuthenticationRequiredResponse(request, "Basic realm=\"proxy\"")),
+                "a Basic challenge cannot be answered without configured proxy credentials");
+    }
+
+    @Test
+    void usesTheProxyAuthenticatorForProxiesWithoutCredentials() throws Exception {
+        HTTPSamplerBase sampler = newSampler();
+        sampler.setProxyHost("proxy.example.invalid");
+        sampler.setProxyPortInt("8080");
+        HTTPOkImpl implementation = new HTTPOkImpl(sampler);
+
+        OkHttpClient client = HTTPOkImpl.createClient(
+                implementation.createHttpClientKey(new URL("http://target.example.invalid/resource")));
+
+        assertTrue(client.proxyAuthenticator() instanceof SpnegoProxyAuthenticator,
+                "a Negotiate challenge of the proxy has to be answered with a SPNEGO token");
+    }
+
+    private static Response proxyAuthenticationRequiredResponse(Request request, String challenge) {
+        return new Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(407)
+                .message("Proxy Authentication Required")
+                .header("Proxy-Authenticate", challenge)
+                .build();
     }
 
     private static Response unauthorizedResponse(Request request, String challenge) {

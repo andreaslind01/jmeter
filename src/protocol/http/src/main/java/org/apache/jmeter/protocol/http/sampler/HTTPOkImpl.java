@@ -21,6 +21,7 @@ import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.MalformedURLException;
 import java.net.Proxy;
 import java.net.Socket;
 import java.net.URL;
@@ -41,6 +42,7 @@ import javax.net.SocketFactory;
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
+import javax.security.auth.Subject;
 
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.Authorization;
@@ -68,7 +70,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import okhttp3.Call;
-import okhttp3.Credentials;
 import okhttp3.EventListener;
 import okhttp3.FormBody;
 import okhttp3.Handshake;
@@ -210,7 +211,12 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
             Call call = client.newCall(request);
             currentCall = call;
-            response = call.execute();
+            SpnegoProxyAuthenticator.setSubject(getSubjectForProxy(clientKey));
+            try {
+                response = call.execute();
+            } finally {
+                SpnegoProxyAuthenticator.clearSubject();
+            }
             result.sampleEnd();
             currentCall = null;
 
@@ -235,8 +241,32 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         }
     }
 
-    private HTTPSampleResult createSampleResult(URL url, String method) {
-        HTTPSampleResult result = new HTTPSampleResult();
+    /**
+     * @return the JAAS {@link Subject} of the Kerberos entry the HTTP Authorization Manager holds
+     *         for the proxy, or {@code null} if the proxy is not covered by such an entry, in
+     *         which case a {@code Negotiate} challenge of the proxy is answered with the Kerberos
+     *         ticket of the JMeter user
+     */
+    Subject getSubjectForProxy(HttpClientKey key) {
+        AuthManager authManager = getAuthManager();
+        URL proxyUrl = getProxyUrl(key);
+        return authManager == null || proxyUrl == null ? null : authManager.getSubjectForUrl(proxyUrl);
+    }
+
+    private static URL getProxyUrl(HttpClientKey key) {
+        if (!key.hasProxy) {
+            return null;
+        }
+        String scheme = StringUtilities.isEmpty(key.proxyScheme) ? HTTPConstants.PROTOCOL_HTTP : key.proxyScheme;
+        try {
+            return new URL(scheme, key.proxyHost, key.proxyPort, "");
+        } catch (MalformedURLException e) {
+            log.debug("Could not build a URL for proxy {}://{}:{}", scheme, key.proxyHost, key.proxyPort, e);
+            return null;
+        }
+    }
+
+    private HTTPSampleResult createSampleResult(URL url, String method) {        HTTPSampleResult result = new HTTPSampleResult();
         configureSampleLabel(result, url);
         result.setHTTPMethod(method);
         result.setURL(url);
@@ -599,17 +629,11 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         if (key.hasProxy) {
             Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(key.proxyHost, key.proxyPort));
             builder.proxy(proxy);
-            if (StringUtilities.isNotEmpty(key.proxyUser)) {
-                builder.proxyAuthenticator((route, response) -> {
-                    if (response.request().header("Proxy-Authorization") != null) {
-                        return null; // Give up after 1 attempt
-                    }
-                    String credential = Credentials.basic(key.proxyUser, key.proxyPass);
-                    return response.request().newBuilder()
-                            .header("Proxy-Authorization", credential)
-                            .build();
-                });
-            }
+            // OkHttp has no built-in support for negotiation based auth schemes, so a
+            // "Proxy-Authenticate: Negotiate" challenge of an enterprise proxy is answered with a
+            // SPNEGO token, while a "Basic" challenge is answered with the configured credentials
+            builder.proxyAuthenticator(
+                    new SpnegoProxyAuthenticator(key.proxyHost, key.proxyPort, key.proxyUser, key.proxyPass));
         }
 
         return builder.build();

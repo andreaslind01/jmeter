@@ -57,9 +57,12 @@ final class SpnegoAuthenticator implements Authenticator {
 
     private static final Logger log = LoggerFactory.getLogger(SpnegoAuthenticator.class);
 
+    /** Builds the GSS token with the credentials of the current JAAS context. */
+    static final TokenGenerator DEFAULT_TOKEN_GENERATOR = SpnegoAuthenticator::createGssToken;
+
     static final SpnegoAuthenticator INSTANCE = new SpnegoAuthenticator();
 
-    private static final String NEGOTIATE = "Negotiate";
+    static final String NEGOTIATE = "Negotiate";
 
     private static final String WWW_AUTHENTICATE = "WWW-Authenticate";
 
@@ -70,7 +73,7 @@ final class SpnegoAuthenticator implements Authenticator {
     private final TokenGenerator tokenGenerator;
 
     private SpnegoAuthenticator() {
-        this(SpnegoAuthenticator::createGssToken);
+        this(DEFAULT_TOKEN_GENERATOR);
     }
 
     SpnegoAuthenticator(TokenGenerator tokenGenerator) {
@@ -95,22 +98,25 @@ final class SpnegoAuthenticator implements Authenticator {
         private final boolean stripPort;
 
         KerberosContext(Subject subject, URL url) {
-            this.subject = subject;
-            this.stripPort = isStripPort(url);
+            this(subject, isStripPort(url.getPort()));
         }
 
-        /**
-         * IE and Firefox always strip the port from the URL before constructing the SPN, so the
-         * port is stripped as well, unless the JMeter property
-         * <code>kerberos.spnego.strip_port</code> asks for a port in the SPN of non default ports.
-         */
-        private static boolean isStripPort(URL url) {
-            if (AuthManager.STRIP_PORT) {
-                return true;
-            }
-            int port = url.getPort();
-            return port == HTTPConstants.DEFAULT_HTTP_PORT || port == HTTPConstants.DEFAULT_HTTPS_PORT;
+        KerberosContext(Subject subject, boolean stripPort) {
+            this.subject = subject;
+            this.stripPort = stripPort;
         }
+    }
+
+    /**
+     * IE and Firefox always strip the port from the URL before constructing the SPN, so the port
+     * is stripped as well, unless the JMeter property <code>kerberos.spnego.strip_port</code> asks
+     * for a port in the SPN of non default ports.
+     */
+    static boolean isStripPort(int port) {
+        if (AuthManager.STRIP_PORT) {
+            return true;
+        }
+        return port == HTTPConstants.DEFAULT_HTTP_PORT || port == HTTPConstants.DEFAULT_HTTPS_PORT;
     }
 
     @Override
@@ -134,8 +140,7 @@ final class SpnegoAuthenticator implements Authenticator {
             log.debug("Server did not offer the {} scheme for {}", NEGOTIATE, request.url());
             return null;
         }
-        String token = generateToken(kerberosContext, request.url(), decodeChallenge(challenge));
-        if (token == null) {
+        String token = generateToken(kerberosContext, request.url(), decodeChallenge(challenge));        if (token == null) {
             return null;
         }
         return request.newBuilder()
@@ -148,7 +153,16 @@ final class SpnegoAuthenticator implements Authenticator {
      *         {@code null} if the server did not ask for {@code Negotiate} authentication
      */
     static String getNegotiateChallenge(Response response) {
-        for (String header : response.headers(WWW_AUTHENTICATE)) {
+        return getNegotiateChallenge(response, WWW_AUTHENTICATE);
+    }
+
+    /**
+     * @param headerName {@value #WWW_AUTHENTICATE} for a server, {@code Proxy-Authenticate} for a proxy
+     * @return the (possibly empty) token of the {@code Negotiate} challenge of the response, or
+     *         {@code null} if the challenge did not offer {@code Negotiate} authentication
+     */
+    static String getNegotiateChallenge(Response response, String headerName) {
+        for (String header : response.headers(headerName)) {
             String trimmedHeader = header.trim();
             if (!trimmedHeader.regionMatches(true, 0, NEGOTIATE, 0, NEGOTIATE.length())) {
                 continue;
@@ -180,23 +194,43 @@ final class SpnegoAuthenticator implements Authenticator {
     }
 
     private String generateToken(KerberosContext kerberosContext, HttpUrl url, byte[] input) {
+        return generateToken(tokenGenerator, kerberosContext.subject,
+                getAuthServer(url, kerberosContext.stripPort), input);
+    }
+
+    /**
+     * Builds the base 64 encoded SPNEGO token for the given service principal name, with the
+     * credentials of the given JAAS {@link Subject}, or with the credentials of the current
+     * context if no subject is available.
+     *
+     * @return the token, or {@code null} if it could not be created
+     */
+    static String generateToken(TokenGenerator tokenGenerator, Subject subject, String authServer, byte[] input) {
         if (SPNEGO_OID == null) {
             return null;
         }
-        String authServer = getAuthServer(url, kerberosContext.stripPort);
-        Subject subject = kerberosContext.subject;
         try {
             byte[] token = subject == null
                     ? tokenGenerator.createToken(authServer, input)
                     : Subject.doAs(subject,
                             (PrivilegedExceptionAction<byte[]>) () -> tokenGenerator.createToken(authServer, input));
-            return Base64.getEncoder().encodeToString(token);
+            return token == null ? null : Base64.getEncoder().encodeToString(token);
         } catch (PrivilegedActionException e) {
             log.warn("Could not create a SPNEGO token for {}", authServer, e.getException());
         } catch (GSSException e) {
             log.warn("Could not create a SPNEGO token for {}", authServer, e);
         }
         return null;
+    }
+
+    /**
+     * Builds the base 64 encoded SPNEGO token for the {@code Negotiate} challenge of a response.
+     *
+     * @return the token, or {@code null} if it could not be created
+     */
+    static String generateToken(TokenGenerator tokenGenerator, Subject subject, String authServer,
+            String challenge) {
+        return generateToken(tokenGenerator, subject, authServer, decodeChallenge(challenge));
     }
 
     private static byte[] createGssToken(String authServer, byte[] input) throws GSSException {
@@ -216,11 +250,15 @@ final class SpnegoAuthenticator implements Authenticator {
     }
 
     static String getAuthServer(HttpUrl url, boolean stripPort) {
-        String host = url.host();
+        return getAuthServer(url.host(), url.port(), stripPort);
+    }
+
+    static String getAuthServer(String host, int port, boolean stripPort) {
+        String authServer = host;
         if (AuthManager.USE_CANONICAL_HOST_NAME) {
-            host = getCanonicalHostName(host);
+            authServer = getCanonicalHostName(authServer);
         }
-        return stripPort ? host : host + ":" + url.port();
+        return stripPort ? authServer : authServer + ":" + port;
     }
 
     private static String getCanonicalHostName(String host) {
