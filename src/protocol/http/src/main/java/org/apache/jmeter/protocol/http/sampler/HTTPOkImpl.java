@@ -214,7 +214,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             result.sampleEnd();
             currentCall = null;
 
-            updateResult(response, request, result);
+            updateResult(response, response.request(), result);
             if (cacheManager != null) {
                 cacheManager.saveDetails(response::header, result);
             }
@@ -266,8 +266,8 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
         AuthManager authManager = getAuthManager();
         Authorization authorization = authManager == null ? null : authManager.getAuthForURL(url);
-        if (authorization != null && AuthManager.Mechanism.BASIC.equals(authorization.getMechanism())) {
-            requestBuilder.header(HTTPConstants.HEADER_AUTHORIZATION, authorization.toBasicHeader());
+        if (authorization != null) {
+            setupAuthorization(url, requestBuilder, authManager, authorization);
         }
 
         RequestBody body = null;
@@ -275,6 +275,27 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             body = createRequestBody(result);
         }
         requestBuilder.method(method, body);
+    }
+
+    /**
+     * Applies the authorization of the HTTP Authorization Manager to the request. {@code BASIC}
+     * credentials are sent preemptively, while the {@code KERBEROS} mechanism needs a challenge of
+     * the server, so its data is attached to the request for {@link SpnegoAuthenticator}.
+     */
+    @SuppressWarnings("deprecation") // Mechanism.BASIC_DIGEST is kept for backwards compatibility
+    static void setupAuthorization(URL url, Request.Builder requestBuilder, AuthManager authManager,
+            Authorization authorization) {
+        AuthManager.Mechanism mechanism = authorization.getMechanism();
+        if (AuthManager.Mechanism.KERBEROS.equals(mechanism)) {
+            requestBuilder.tag(SpnegoAuthenticator.KerberosContext.class,
+                    new SpnegoAuthenticator.KerberosContext(authManager.getSubjectForUrl(url), url));
+        } else if (AuthManager.Mechanism.BASIC.equals(mechanism)
+                || AuthManager.Mechanism.BASIC_DIGEST.equals(mechanism)) {
+            requestBuilder.header(HTTPConstants.HEADER_AUTHORIZATION, authorization.toBasicHeader());
+        } else {
+            log.warn("The {} implementation does not support the {} authorization mechanism for {}",
+                    HTTPSamplerFactory.IMPL_OK_HTTP, mechanism, url);
+        }
     }
 
     private static boolean canHaveBody(String method) {
@@ -537,7 +558,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         return JMeterUtils.getPropDefault(RETRY_ON_CONNECTION_FAILURE_PROPERTY, false);
     }
 
-    private static OkHttpClient createClient(HttpClientKey key) {
+    static OkHttpClient createClient(HttpClientKey key) {
         OkHttpClient.Builder builder = new OkHttpClient.Builder();
         builder.addInterceptor(DECOMPRESSION_INTERCEPTOR);
         builder.eventListener(CONNECT_TIME_LISTENER);
@@ -547,6 +568,9 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         // failed connections (and of 408 responses) are disabled, just like disableAutomaticRetries()
         // in the HttpClient based implementations.
         builder.retryOnConnectionFailure(isRetryOnConnectionFailureEnabled());
+        // OkHttp has no built-in support for negotiation based auth schemes, so the SPNEGO
+        // (Kerberos) challenges of the HTTP Authorization Manager are answered here
+        builder.authenticator(SpnegoAuthenticator.INSTANCE);
 
         if (key.connectTimeout > 0) {
             builder.connectTimeout(key.connectTimeout, TimeUnit.MILLISECONDS);
@@ -591,7 +615,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         return builder.build();
     }
 
-    private HttpClientKey createHttpClientKey(URL url) throws IOException {
+    HttpClientKey createHttpClientKey(URL url) throws IOException {
         String proxyScheme = getProxyScheme();
         String proxyHost = getProxyHost();
         int proxyPort = getProxyPortInt();
@@ -780,7 +804,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         }
     }
 
-    private static final class HttpClientKey {
+    static final class HttpClientKey {
         private final String protocol;
         private final String authority;
         private final boolean hasProxy;

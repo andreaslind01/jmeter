@@ -3728,6 +3728,7 @@ information for the user named, "<code>jmeter</code>".</property>
 <dt>Java</dt><dd><code>BASIC</code></dd>
 <dt>HttpClient 4</dt><dd><code>BASIC</code>, <code>DIGEST</code> and <code>Kerberos</code></dd>
 <dt>HttpClient 5</dt><dd><code>BASIC</code>, <code>DIGEST</code> and <code>Kerberos</code></dd>
+<dt>OkHttp</dt><dd><code>BASIC</code> and <code>Kerberos</code></dd>
 </dl>
 </property>
 </properties>

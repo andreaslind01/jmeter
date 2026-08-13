@@ -22,10 +22,15 @@ import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.URL;
+import java.util.Base64;
 import java.util.List;
 
 import org.apache.jmeter.junit.JMeterTestCase;
@@ -39,7 +44,11 @@ import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
+import okhttp3.Request;
+import okhttp3.Response;
 
 class TestHTTPOkFeatures extends JMeterTestCase {
 
@@ -297,6 +306,156 @@ class TestHTTPOkFeatures extends JMeterTestCase {
             }
             server.stop();
         }
+    }
+
+    @Test
+    void attachesKerberosContextForKerberosAuthorization() throws Exception {
+        AuthManager authManager = new AuthManager();
+        authManager.set(-1, "http://kerberos.example.invalid/", "user", "pass", "", "",
+                AuthManager.Mechanism.KERBEROS);
+        URL url = new URL("http://kerberos.example.invalid/protected");
+        Request.Builder requestBuilder = new Request.Builder().url(url);
+
+        HTTPOkImpl.setupAuthorization(url, requestBuilder, authManager, authManager.getAuthForURL(url));
+        Request request = requestBuilder.build();
+
+        assertNull(request.header(HTTPConstants.HEADER_AUTHORIZATION),
+                "the credentials of a Kerberos authorization are only used to log in to the KDC");
+        assertNotNull(request.tag(SpnegoAuthenticator.KerberosContext.class),
+                "the request needs the Kerberos data to answer a Negotiate challenge");
+    }
+
+    @Test
+    void doesNotAttachKerberosContextForBasicAuthorization() throws Exception {
+        AuthManager authManager = new AuthManager();
+        authManager.set(-1, "http://basic.example.invalid/", "user", "pass", "", "", AuthManager.Mechanism.BASIC);
+        URL url = new URL("http://basic.example.invalid/protected");
+        Request.Builder requestBuilder = new Request.Builder().url(url);
+
+        HTTPOkImpl.setupAuthorization(url, requestBuilder, authManager, authManager.getAuthForURL(url));
+        Request request = requestBuilder.build();
+
+        assertEquals("Basic dXNlcjpwYXNz", request.header(HTTPConstants.HEADER_AUTHORIZATION));
+        assertNull(request.tag(SpnegoAuthenticator.KerberosContext.class));
+    }
+
+    @Test
+    void ignoresChallengesOfRequestsWithoutKerberosAuthorization() throws Exception {
+        Response response = unauthorizedResponse(new Request.Builder()
+                .url("http://kerberos.example.invalid/protected").build(), "Negotiate");
+
+        assertNull(SpnegoAuthenticator.INSTANCE.authenticate(null, response),
+                "requests without a Kerberos authorization must not be retried");
+    }
+
+    @Test
+    void ignoresResponsesWithoutNegotiateChallenge() throws Exception {
+        URL url = new URL("http://kerberos.example.invalid/protected");
+        Request request = new Request.Builder()
+                .url(url)
+                .tag(SpnegoAuthenticator.KerberosContext.class,
+                        new SpnegoAuthenticator.KerberosContext(null, url))
+                .build();
+
+        assertNull(SpnegoAuthenticator.INSTANCE.authenticate(null, unauthorizedResponse(request, "Basic realm=\"x\"")),
+                "a server that does not offer Negotiate must not get a SPNEGO token");
+    }
+
+    @Test
+    void doesNotRepeatRejectedSpnegoTokens() throws Exception {
+        URL url = new URL("http://kerberos.example.invalid/protected");
+        Request request = new Request.Builder()
+                .url(url)
+                .header(HTTPConstants.HEADER_AUTHORIZATION, "Negotiate token")
+                .tag(SpnegoAuthenticator.KerberosContext.class,
+                        new SpnegoAuthenticator.KerberosContext(null, url))
+                .build();
+
+        assertNull(SpnegoAuthenticator.INSTANCE.authenticate(null, unauthorizedResponse(request, "Negotiate")),
+                "a rejected token must not be sent again to avoid an endless loop");
+    }
+
+    @Test
+    void failsGracefullyWhenTheNegotiateChallengeCannotBeAnswered() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/kerberos")).willReturn(aResponse()
+                    .withHeader("WWW-Authenticate", "Negotiate").withStatus(401)));
+            AuthManager authManager = new AuthManager();
+            authManager.set(-1, server.url("/"), "user", "pass", "", "", AuthManager.Mechanism.KERBEROS);
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setAuthManager(authManager);
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/kerberos")), HTTPConstants.GET, false, 1);
+
+            assertEquals("401", result.getResponseCode(),
+                    "a failed negotiation has to report the response of the server");
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void usesTheSpnegoAuthenticatorForNegotiateChallenges() throws Exception {
+        HTTPSamplerBase sampler = newSampler();
+        HTTPOkImpl implementation = new HTTPOkImpl(sampler);
+
+        OkHttpClient client = HTTPOkImpl.createClient(
+                implementation.createHttpClientKey(new URL("http://kerberos.example.invalid/protected")));
+
+        assertSame(SpnegoAuthenticator.INSTANCE, client.authenticator(),
+                "the client has to answer Negotiate challenges with a SPNEGO token");
+    }
+
+    @Test
+    void sendsTheSpnegoTokenAfterANegotiateChallenge() throws Exception {
+        URL url = new URL("http://kerberos.example.invalid/protected");
+        Request request = new Request.Builder()
+                .url(url)
+                .tag(SpnegoAuthenticator.KerberosContext.class,
+                        new SpnegoAuthenticator.KerberosContext(null, url))
+                .build();
+        SpnegoAuthenticator authenticator =
+                new SpnegoAuthenticator((authServer, input) -> ("token-for-" + authServer).getBytes(UTF_8));
+
+        Request retry = authenticator.authenticate(null, unauthorizedResponse(request, "Negotiate"));
+
+        assertNotNull(retry, "the challenged request has to be repeated with a SPNEGO token");
+        assertEquals("Negotiate " + Base64.getEncoder()
+                        .encodeToString("token-for-kerberos.example.invalid".getBytes(UTF_8)),
+                retry.header(HTTPConstants.HEADER_AUTHORIZATION));
+    }
+
+    @Test
+    void parsesTheTokenOfTheNegotiateChallenge() {
+        Request request = new Request.Builder().url("http://kerberos.example.invalid/protected").build();
+
+        assertEquals("", SpnegoAuthenticator.getNegotiateChallenge(unauthorizedResponse(request, "Negotiate")));
+        assertEquals("", SpnegoAuthenticator.getNegotiateChallenge(unauthorizedResponse(request, "negotiate")));
+        assertEquals("", SpnegoAuthenticator.getNegotiateChallenge(unauthorizedResponse(request, "Negotiate, NTLM")));
+        assertEquals("a1b2", SpnegoAuthenticator.getNegotiateChallenge(unauthorizedResponse(request, "Negotiate a1b2")));
+        assertNull(SpnegoAuthenticator.getNegotiateChallenge(unauthorizedResponse(request, "NTLM")));
+        assertNull(SpnegoAuthenticator.getNegotiateChallenge(unauthorizedResponse(request, "NegotiateX realm=\"x\"")));
+    }
+
+    @Test
+    void stripsThePortFromTheServicePrincipalName() {
+        HttpUrl url = HttpUrl.get("http://kerberos.example.invalid:8080/protected");
+
+        assertEquals("kerberos.example.invalid", SpnegoAuthenticator.getAuthServer(url, true));
+        assertEquals("kerberos.example.invalid:8080", SpnegoAuthenticator.getAuthServer(url, false));
+    }
+
+    private static Response unauthorizedResponse(Request request, String challenge) {
+        return new Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(401)
+                .message("Unauthorized")
+                .header("WWW-Authenticate", challenge)
+                .build();
     }
 
     private static HTTPSamplerBase newSampler() {
