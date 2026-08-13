@@ -56,6 +56,9 @@ public class TestHttpVersionComboBox {
         implementation.setSelectedItem("Java");
         assertEquals(Arrays.asList("", "HTTP/1.1", "HTTP/2"), items(httpVersion));
 
+        implementation.setSelectedItem("OkHttp");
+        assertEquals(Arrays.asList("", "HTTP/1.1", "HTTP/2"), items(httpVersion));
+
         implementation.setSelectedItem("HttpClient4");
         assertEquals(Arrays.asList("", "HTTP/1.1"), items(httpVersion));
     }
