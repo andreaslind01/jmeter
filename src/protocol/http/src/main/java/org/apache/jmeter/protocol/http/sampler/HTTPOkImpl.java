@@ -611,9 +611,9 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     private static String formatProtocol(Protocol protocol) {
         if (protocol == Protocol.HTTP_2 || protocol == Protocol.H2_PRIOR_KNOWLEDGE) {
-            return "HTTP/2";
+            return HTTPConstants.HTTP_2;
         }
-        return "HTTP/1.1";
+        return HTTPConstants.HTTP_1_1;
     }
 
     private static String getRequestHeaders(Request request) {
@@ -639,7 +639,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
         sentBytes += method.getBytes(Charset.defaultCharset()).length + 1;
         sentBytes += pathAndQuery.getBytes(Charset.defaultCharset()).length + 1;
-        sentBytes += "HTTP/1.1\r\n".getBytes(Charset.defaultCharset()).length;
+        sentBytes += (HTTPConstants.HTTP_1_1 + "\r\n").getBytes(Charset.defaultCharset()).length;
 
         Headers headers = request.headers();
         for (int i = 0; i < headers.size(); i++) {
@@ -810,7 +810,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
     static List<Protocol> getProtocols(String samplerHttpVersion, String defaultHttpVersion, String scheme) {
         String httpVersion = StringUtilities.isBlank(samplerHttpVersion) ? defaultHttpVersion : samplerHttpVersion;
         // OkHttp negotiates the protocol, so a strict HTTP/2 request is negotiated as well
-        if (HTTPConstants.HTTP_VERSION_2.equalsIgnoreCase(httpVersion) || "2".equals(httpVersion)
+        if (HTTPConstants.HTTP_VERSION_2.equalsIgnoreCase(httpVersion)
                 || HTTPConstants.HTTP_VERSION_2_STRICT.equalsIgnoreCase(httpVersion)) {
             if (HTTP_2_PRIOR_KNOWLEDGE && !HTTPConstants.PROTOCOL_HTTPS.equalsIgnoreCase(scheme)) {
                 return List.of(Protocol.H2_PRIOR_KNOWLEDGE);
