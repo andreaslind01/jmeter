@@ -19,9 +19,11 @@ package org.apache.jmeter.protocol.http.sampler;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
+import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.Socket;
 import java.net.URL;
@@ -30,12 +32,16 @@ import java.nio.charset.Charset;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.Inflater;
 
 import javax.net.SocketFactory;
@@ -70,6 +76,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import okhttp3.Call;
+import okhttp3.Connection;
+import okhttp3.ConnectionPool;
 import okhttp3.EventListener;
 import okhttp3.FormBody;
 import okhttp3.Handshake;
@@ -110,6 +118,24 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     private static final String RETRY_ON_CONNECTION_FAILURE_PROPERTY = "okhttp.retry_on_connection_failure";
 
+    private static final String STALE_CONNECTION_RETRIES_PROPERTY = "okhttp.stale_connection_retries";
+
+    /**
+     * Maximum number of idle connections OkHttp keeps per client. JMeter uses a client per thread
+     * and target, and the parallel downloads of the embedded resources of a page share it, so the
+     * OkHttp default of {@code 5} is one short of the six parallel downloads JMeter defaults to.
+     */
+    private static final int MAX_IDLE_CONNECTIONS =
+            JMeterUtils.getPropDefault("okhttp.max_idle_connections", 6);
+
+    /**
+     * Milliseconds an unused connection is kept in the pool. Aligning it with the keep alive
+     * timeout of the server (or of a load balancer in between) avoids handing out connections the
+     * peer has closed in the meantime.
+     */
+    private static final long IDLE_CONNECTION_TIMEOUT =
+            JMeterUtils.getPropDefault("okhttp.idle_connection_timeout", 300_000L);
+
     private static final String DEFAULT_USER_AGENT = "OkHttp/" + OkHttp.VERSION;
 
     private static final boolean HTTP_2_PRIOR_KNOWLEDGE =
@@ -130,7 +156,32 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         }
     };
 
+    /**
+     * Connections which already carried a response. A connection only gets here after the peer
+     * answered on it, so a failure on one of them means that the connection was reused, and that
+     * the peer closed it in the meantime.
+     */
+    private static final Set<Connection> USED_CONNECTIONS =
+            Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+
     private static final EventListener CONNECT_TIME_LISTENER = new EventListener() {
+        @Override
+        public void connectionAcquired(Call call, Connection connection) {
+            ConnectionReuseTracker tracker = call.request().tag(ConnectionReuseTracker.class);
+            if (tracker != null) {
+                tracker.connectionAcquired(connection);
+            }
+        }
+
+        @Override
+        public void responseHeadersEnd(Call call, Response response) {
+            ConnectionReuseTracker tracker = call.request().tag(ConnectionReuseTracker.class);
+            Connection connection = tracker == null ? null : tracker.getConnection();
+            if (connection != null) {
+                USED_CONNECTIONS.add(connection);
+            }
+        }
+
         @Override
         public void connectEnd(Call call, InetSocketAddress inetSocketAddress, Proxy proxy, Protocol protocol) {
             recordConnectEnd(call);
@@ -148,6 +199,61 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             }
         }
     };
+
+    /**
+     * Repeats a request that failed on a connection which had already carried a response, that is
+     * on a connection which was reused. OkHttp only checks a pooled connection for a close of the
+     * peer when the request is not a {@code GET}, so a keep alive connection the server (or a load
+     * balancer in between) closed while the thread was busy elsewhere is used as it is, and the
+     * sample fails with {@code unexpected end of stream}. That is an artifact of the connection
+     * pool rather than server behavior, so the request is sent again on a fresh connection, which
+     * is what {@code retryOnConnectionFailure} would do if the transparent retries were not
+     * disabled. Failures on a connection that never carried a response, timeouts and protocol
+     * errors are never repeated, so a server that refuses or drops new connections keeps failing
+     * the sample. As a pool can hold several connections the peer closed, the request is repeated
+     * up to {@code okhttp.stale_connection_retries} times, each attempt discarding the connection
+     * it failed on.
+     */
+    private static final Interceptor STALE_CONNECTION_RETRY_INTERCEPTOR = chain -> {
+        Request request = chain.request();
+        ConnectionReuseTracker tracker = request.tag(ConnectionReuseTracker.class);
+        int attempt = 0;
+        while (true) {
+            if (tracker != null) {
+                tracker.reset();
+            }
+            try {
+                return chain.proceed(request);
+            } catch (IOException e) {
+                attempt++;
+                if (attempt > getStaleConnectionRetries() || !isRepeatableOnANewConnection(chain, tracker, e)) {
+                    throw e;
+                }
+                // Every attempt discards the connection it failed on, so a pool full of connections
+                // the peer closed while the thread was idle is drained request by request
+                log.debug("Repeating {} on another connection, the reused connection was closed by the peer",
+                        request.url(), e);
+            }
+        }
+    };
+
+    private static boolean isRepeatableOnANewConnection(Interceptor.Chain chain, ConnectionReuseTracker tracker,
+            IOException failure) {
+        if (tracker == null || chain.call().isCanceled()) {
+            return false;
+        }
+        if (!isStaleConnectionFailure(failure)) {
+            log.debug("Not repeating {}, the failure is not a closed connection", chain.request().url(), failure);
+            return false;
+        }
+        Connection connection = tracker.getConnection();
+        if (connection == null || !USED_CONNECTIONS.contains(connection)) {
+            log.debug("Not repeating {}, the connection which failed did not carry a response before",
+                    chain.request().url(), failure);
+            return false;
+        }
+        return true;
+    }
 
     private static final Interceptor DECOMPRESSION_INTERCEPTOR = chain -> {
         Response response = chain.proceed(chain.request());
@@ -277,6 +383,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             HTTPSampleResult result) throws IOException {
         requestBuilder.url(url);
         requestBuilder.tag(HTTPSampleResult.class, result);
+        requestBuilder.tag(ConnectionReuseTracker.class, new ConnectionReuseTracker());
 
         setConnectionHeaders(requestBuilder, getHeaderManager());
         setDefaultUserAgent(requestBuilder);
@@ -588,10 +695,48 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         return JMeterUtils.getPropDefault(RETRY_ON_CONNECTION_FAILURE_PROPERTY, false);
     }
 
+    private static int getStaleConnectionRetries() {
+        // Every attempt discards the connection it failed on, so a pool full of connections the
+        // peer closed needs as many attempts as the pool can hold
+        return JMeterUtils.getPropDefault(STALE_CONNECTION_RETRIES_PROPERTY, MAX_IDLE_CONNECTIONS);
+    }
+
+    /**
+     * @return whether {@code e} is the kind of failure a connection which the peer closed while it
+     *         was idle in the pool produces. Read timeouts and protocol violations are answers of
+     *         the server (or of the network) and have to fail the sample.
+     */
+    private static boolean isStaleConnectionFailure(IOException e) {
+        return !(e instanceof InterruptedIOException) && !(e instanceof ProtocolException);
+    }
+
+    /**
+     * Remembers the connection a call is using, which tells a failure of a reused connection apart
+     * from a failure of a connection that has never carried a response.
+     */
+    static final class ConnectionReuseTracker {
+        private final AtomicReference<Connection> connection = new AtomicReference<>();
+
+        void reset() {
+            connection.set(null);
+        }
+
+        void connectionAcquired(Connection acquired) {
+            connection.set(acquired);
+        }
+
+        Connection getConnection() {
+            return connection.get();
+        }
+    }
+
     static OkHttpClient createClient(HttpClientKey key) {
         OkHttpClient.Builder builder = new OkHttpClient.Builder();
+        builder.addInterceptor(STALE_CONNECTION_RETRY_INTERCEPTOR);
         builder.addInterceptor(DECOMPRESSION_INTERCEPTOR);
         builder.eventListener(CONNECT_TIME_LISTENER);
+        builder.connectionPool(
+                new ConnectionPool(MAX_IDLE_CONNECTIONS, IDLE_CONNECTION_TIMEOUT, TimeUnit.MILLISECONDS));
         builder.followRedirects(key.autoRedirects);
         builder.followSslRedirects(key.autoRedirects);
         // JMeter must report what the server actually did, so by default transparent retries of

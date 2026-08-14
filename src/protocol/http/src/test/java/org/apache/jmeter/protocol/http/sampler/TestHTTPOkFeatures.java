@@ -24,14 +24,26 @@ import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.security.auth.Subject;
 
@@ -56,6 +68,8 @@ import okhttp3.Response;
 class TestHTTPOkFeatures extends JMeterTestCase {
 
     private static final String RETRY_PROPERTY = "okhttp.retry_on_connection_failure";
+
+    private static final String STALE_RETRY_PROPERTY = "okhttp.stale_connection_retries";
 
     @Test
     void usesSamplerHttpVersionWhenSpecified() {
@@ -534,6 +548,186 @@ class TestHTTPOkFeatures extends JMeterTestCase {
 
         assertTrue(client.proxyAuthenticator() instanceof SpnegoProxyAuthenticator,
                 "a Negotiate challenge of the proxy has to be answered with a SPNEGO token");
+    }
+
+    @Test
+    void repeatsRequestWhenTheServerClosedThePooledConnection() throws Exception {
+        try (ClosingKeepAliveServer server = new ClosingKeepAliveServer()) {
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/1.1");
+            URL url = new URL("http://localhost:" + server.getPort() + "/stale");
+
+            assertEquals("200", sampler.sample(url, HTTPConstants.GET, false, 1).getResponseCode());
+            server.awaitClosedConnections(1);
+            HTTPSampleResult result = sampler.sample(url, HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode(),
+                    "a connection the server closed while it was idle has to be replaced silently");
+            assertEquals(2, server.getRequestCount(),
+                    "the server must not see the request of the dead connection twice");
+        }
+    }
+
+    @Test
+    void reportsTheClosedPooledConnectionWhenTheRetryIsDisabled() throws Exception {
+        String oldValue = JMeterUtils.getProperty(STALE_RETRY_PROPERTY);
+        JMeterUtils.setProperty(STALE_RETRY_PROPERTY, "0");
+        try (ClosingKeepAliveServer server = new ClosingKeepAliveServer()) {
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/1.1");
+            URL url = new URL("http://localhost:" + server.getPort() + "/stale");
+
+            assertEquals("200", sampler.sample(url, HTTPConstants.GET, false, 1).getResponseCode());
+            server.awaitClosedConnections(1);
+            HTTPSampleResult result = sampler.sample(url, HTTPConstants.GET, false, 1);
+
+            assertFalse(result.isSuccessful(), "without the retry the dead connection fails the sample");
+            assertTrue(result.getResponseCode().startsWith("Non HTTP response code"),
+                    "expected an IO failure, but got " + result.getResponseCode());
+        } finally {
+            if (oldValue == null) {
+                JMeterUtils.getJMeterProperties().remove(STALE_RETRY_PROPERTY);
+            } else {
+                JMeterUtils.setProperty(STALE_RETRY_PROPERTY, oldValue);
+            }
+        }
+    }
+
+    @Test
+    void doesNotRepeatRequestWhenTheServerDropsANewConnection() throws Exception {
+        try (ClosingKeepAliveServer server = new ClosingKeepAliveServer(true)) {
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/1.1");
+            URL url = new URL("http://localhost:" + server.getPort() + "/dropped");
+
+            HTTPSampleResult result = sampler.sample(url, HTTPConstants.GET, false, 1);
+
+            assertFalse(result.isSuccessful(),
+                    "a server that drops a fresh connection has to fail the sample");
+            assertEquals(1, server.getRequestCount(), "a fresh connection must not be retried");
+        }
+    }
+
+    @Test
+    void repeatsRequestUntilAFreshConnectionIsUsedWhenAllPooledConnectionsAreDead() throws Exception {
+        int parallel = 4;
+        try (ClosingKeepAliveServer server = new ClosingKeepAliveServer(false, 300)) {
+            URL url = new URL("http://localhost:" + server.getPort() + "/parallel");
+            // Concurrent samples fill the pool with connections which the server closes afterwards,
+            // like the parallel downloads of the embedded resources of a page do
+            ExecutorService downloads = Executors.newFixedThreadPool(parallel);
+            try {
+                List<Future<HTTPSampleResult>> results = new ArrayList<>();
+                for (int i = 0; i < parallel; i++) {
+                    results.add(downloads.submit(() -> newSampler().sample(url, HTTPConstants.GET, false, 1)));
+                }
+                for (Future<HTTPSampleResult> result : results) {
+                    assertEquals("200", result.get().getResponseCode());
+                }
+                server.awaitClosedConnections(parallel);
+
+                for (int i = 0; i < parallel; i++) {
+                    Future<HTTPSampleResult> result =
+                            downloads.submit(() -> newSampler().sample(url, HTTPConstants.GET, false, 1));
+                    assertEquals("200", result.get().getResponseCode(),
+                            "a pool full of connections the server closed has to be drained silently");
+                }
+            } finally {
+                downloads.shutdownNow();
+            }
+        }
+    }
+
+    /**
+     * Answers every request with a keep alive response, but closes the connection right afterwards,
+     * like a server (or a load balancer) that gives up on an idle connection.
+     */
+    private static final class ClosingKeepAliveServer implements AutoCloseable {
+        private final ServerSocket serverSocket;
+        private final AtomicInteger requestCount = new AtomicInteger();
+        private final AtomicInteger closedConnections = new AtomicInteger();
+        private final Thread acceptor;
+        private final boolean dropWithoutResponse;
+        private final long responseDelayMillis;
+
+        ClosingKeepAliveServer() throws IOException {
+            this(false, 0);
+        }
+
+        ClosingKeepAliveServer(boolean dropWithoutResponse) throws IOException {
+            this(dropWithoutResponse, 0);
+        }
+
+        ClosingKeepAliveServer(boolean dropWithoutResponse, long responseDelayMillis) throws IOException {
+            this.dropWithoutResponse = dropWithoutResponse;
+            this.responseDelayMillis = responseDelayMillis;
+            serverSocket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            acceptor = new Thread(this::acceptConnections, "closing-keep-alive-server");
+            acceptor.setDaemon(true);
+            acceptor.start();
+        }
+
+        private void acceptConnections() {
+            while (!serverSocket.isClosed()) {
+                try {
+                    Socket socket = serverSocket.accept();
+                    Thread handler = new Thread(() -> handleConnection(socket), "closing-keep-alive-handler");
+                    handler.setDaemon(true);
+                    handler.start();
+                } catch (IOException e) {
+                    return;
+                }
+            }
+        }
+
+        private void handleConnection(Socket socket) {
+            try (Socket connection = socket) {
+                readRequest(connection);
+                requestCount.incrementAndGet();
+                if (!dropWithoutResponse) {
+                    if (responseDelayMillis > 0) {
+                        Thread.sleep(responseDelayMillis);
+                    }
+                    connection.getOutputStream().write(
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".getBytes(UTF_8));
+                    connection.getOutputStream().flush();
+                }
+            } catch (IOException e) {
+                // the connection is closed anyway
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                closedConnections.incrementAndGet();
+            }
+        }
+
+        private static void readRequest(Socket socket) throws IOException {
+            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), UTF_8));
+            String line = reader.readLine();
+            while (line != null && !line.isEmpty()) {
+                line = reader.readLine();
+            }
+        }
+
+        void awaitClosedConnections(int expected) throws InterruptedException {
+            for (int i = 0; i < 100 && closedConnections.get() < expected; i++) {
+                Thread.sleep(20);
+            }
+        }
+
+        int getPort() {
+            return serverSocket.getLocalPort();
+        }
+
+        int getRequestCount() {
+            return requestCount.get();
+        }
+
+        @Override
+        public void close() throws IOException {
+            serverSocket.close();
+            acceptor.interrupt();
+        }
     }
 
     private static Response proxyAuthenticationRequiredResponse(Request request, String challenge) {
