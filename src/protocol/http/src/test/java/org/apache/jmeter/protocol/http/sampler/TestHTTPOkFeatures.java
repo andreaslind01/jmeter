@@ -62,6 +62,8 @@ import org.junit.jupiter.api.Test;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.http.HttpHeader;
+import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 
 import okhttp3.Credentials;
 import okhttp3.HttpUrl;
@@ -855,6 +857,49 @@ class TestHTTPOkFeatures extends JMeterTestCase {
             Files.deleteIfExists(upload);
             server.stop();
         }
+    }
+
+    @Test
+    void countsTheBytesTheRequestOccupiesOnTheWire() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        Path upload = Files.createTempFile("jmeter-okhttp-sent-bytes-", ".bin");
+        try {
+            Files.write(upload, new byte[512 * 1024]);
+            server.stubFor(post(urlEqualTo("/sentBytes")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion(HTTPConstants.HTTP_1_1);
+            sampler.setDoMultipart(true);
+            sampler.setHTTPFiles(new HTTPFileArg[] {
+                    new HTTPFileArg(upload.toString(), "upload", "application/octet-stream") });
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/sentBytes")), HTTPConstants.POST, false, 1);
+
+            assertEquals("200", result.getResponseCode());
+            LoggedRequest sent = server.findAll(postRequestedFor(urlEqualTo("/sentBytes"))).get(0);
+            assertEquals(wireSize(sent), result.getSentBytes(),
+                    "the sample must report the size the request had on the wire");
+        } finally {
+            Files.deleteIfExists(upload);
+            server.stop();
+        }
+    }
+
+    /**
+     * @return the number of bytes the request occupied on the wire, computed from what the server
+     *         received: request line, headers, the empty line and the body
+     */
+    private static long wireSize(LoggedRequest request) {
+        long size = request.getMethod().getName().length() + 1L
+                + request.getUrl().length() + 1L
+                + HTTPConstants.HTTP_1_1.length() + 2L;
+        for (HttpHeader header : request.getHeaders().all()) {
+            for (String value : header.values()) {
+                size += header.key().length() + 2L + value.length() + 2L;
+            }
+        }
+        return size + 2L + request.getBody().length;
     }
 
     @Test

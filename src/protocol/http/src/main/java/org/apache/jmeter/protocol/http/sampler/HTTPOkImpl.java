@@ -41,6 +41,7 @@ import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.Inflater;
 
@@ -168,7 +169,13 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
     private static final Set<Connection> USED_CONNECTIONS =
             Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
 
-    private static final EventListener CONNECT_TIME_LISTENER = new EventListener() {
+    private static final EventListener SAMPLE_EVENT_LISTENER = new SampleEventListener();
+
+    /**
+     * Feeds the sample result with the data OkHttp only exposes while the call is running: the
+     * moment a connection is established and the number of bytes the request occupies on the wire.
+     */
+    private static final class SampleEventListener extends EventListener {
         @Override
         public void connectionAcquired(Call call, Connection connection) {
             ConnectionReuseTracker tracker = call.request().tag(ConnectionReuseTracker.class);
@@ -192,17 +199,35 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         }
 
         @Override
+        public void requestHeadersEnd(Call call, Request request) {
+            SentBytesTracker tracker = call.request().tag(SentBytesTracker.class);
+            if (tracker != null) {
+                // The request of the event carries the headers OkHttp added on its own, such as
+                // Host, Content-Length, Connection and Accept-Encoding
+                tracker.addSentBytes(calculateRequestHeaderBytes(request));
+            }
+        }
+
+        @Override
+        public void requestBodyEnd(Call call, long byteCount) {
+            SentBytesTracker tracker = call.request().tag(SentBytesTracker.class);
+            if (tracker != null) {
+                tracker.addSentBytes(byteCount);
+            }
+        }
+
+        @Override
         public void secureConnectEnd(Call call, Handshake handshake) {
             recordConnectEnd(call);
         }
 
-        private void recordConnectEnd(Call call) {
+        private static void recordConnectEnd(Call call) {
             HTTPSampleResult sample = call.request().tag(HTTPSampleResult.class);
             if (sample != null) {
                 sample.connectEnd();
             }
         }
-    };
+    }
 
     /**
      * Repeats a request that failed on a connection which had already carried a response, that is
@@ -345,7 +370,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             }
             if (request != null) {
                 result.setRequestHeaders(getRequestHeaders(request));
-                result.setSentBytes(calculateSentBytes(request));
+                result.setSentBytes(getSentBytes(request));
             }
             return errorResult(e, result);
         } finally {
@@ -391,6 +416,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         requestBuilder.url(url);
         requestBuilder.tag(HTTPSampleResult.class, result);
         requestBuilder.tag(ConnectionReuseTracker.class, new ConnectionReuseTracker());
+        requestBuilder.tag(SentBytesTracker.class, new SentBytesTracker());
 
         setConnectionHeaders(requestBuilder, getHeaderManager());
         setDefaultUserAgent(requestBuilder);
@@ -704,7 +730,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     private void updateResult(Response response, Request request, HTTPSampleResult result) {
         result.setRequestHeaders(getRequestHeaders(request));
-        result.setSentBytes(calculateSentBytes(request));
+        result.setSentBytes(getSentBytes(request));
         int statusCode = response.code();
         result.setResponseCode(Integer.toString(statusCode));
         result.setResponseMessage(response.message());
@@ -764,10 +790,29 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         return headers.toString();
     }
 
+    /**
+     * @param request request of the sample, may be {@code null} if it could not be built
+     * @return the bytes the call wrote on the wire, including every attempt of a redirect or of an
+     *         authentication challenge. If nothing was sent, for instance because the connection
+     *         failed, the request that was about to be sent is measured instead
+     */
+    private static long getSentBytes(Request request) {
+        if (request == null) {
+            return 0;
+        }
+        SentBytesTracker tracker = request.tag(SentBytesTracker.class);
+        long sentBytes = tracker == null ? 0 : tracker.getSentBytes();
+        return sentBytes > 0 ? sentBytes : calculateSentBytes(request);
+    }
+
     private static long calculateSentBytes(Request request) {
         if (request == null) {
             return 0;
         }
+        return calculateRequestHeaderBytes(request) + calculateRequestBodyBytes(request);
+    }
+
+    private static long calculateRequestHeaderBytes(Request request) {
         long sentBytes = 0;
         String method = request.method();
         HttpUrl url = request.url();
@@ -790,23 +835,23 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             sentBytes += 2;
         }
         sentBytes += 2;
-
-        RequestBody body = request.body();
-        if (body != null) {
-            try {
-                long contentLength = body.contentLength();
-                if (contentLength >= 0) {
-                    sentBytes += contentLength;
-                } else {
-                    Buffer buffer = new Buffer();
-                    body.writeTo(buffer);
-                    sentBytes += buffer.size();
-                }
-            } catch (IOException e) {
-                log.debug("Exception measuring request body length", e);
-            }
-        }
         return sentBytes;
+    }
+
+    private static long calculateRequestBodyBytes(Request request) {
+        RequestBody body = request.body();
+        if (body == null) {
+            return 0;
+        }
+        try {
+            // The body is never written into a buffer here, as an upload is streamed from disk and
+            // may not fit into the heap. A body of unknown length is only reported by the tracker
+            long contentLength = body.contentLength();
+            return Math.max(contentLength, 0);
+        } catch (IOException e) {
+            log.debug("Exception measuring request body length", e);
+            return 0;
+        }
     }
 
     private static void saveConnectionCookies(Response response, URL url, CookieManager cookieManager) {
@@ -866,11 +911,32 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         }
     }
 
+    /**
+     * Sums the bytes a call wrote on the wire. The request headers are measured when OkHttp has
+     * assembled them, so the headers it adds on its own are counted, and the body is reported by
+     * OkHttp once it has been written, so a streamed file upload counts with its real size instead
+     * of the placeholder the request view shows. A call that is repeated, for instance to follow a
+     * redirect or to answer a challenge, adds up every attempt.
+     */
+    static final class SentBytesTracker {
+        private final AtomicLong sentBytes = new AtomicLong();
+
+        void addSentBytes(long bytes) {
+            if (bytes > 0) {
+                sentBytes.addAndGet(bytes);
+            }
+        }
+
+        long getSentBytes() {
+            return sentBytes.get();
+        }
+    }
+
     static OkHttpClient createClient(HttpClientKey key) {
         OkHttpClient.Builder builder = new OkHttpClient.Builder();
         builder.addInterceptor(STALE_CONNECTION_RETRY_INTERCEPTOR);
         builder.addInterceptor(DECOMPRESSION_INTERCEPTOR);
-        builder.eventListener(CONNECT_TIME_LISTENER);
+        builder.eventListener(SAMPLE_EVENT_LISTENER);
         builder.connectionPool(
                 new ConnectionPool(MAX_IDLE_CONNECTIONS, IDLE_CONNECTION_TIMEOUT, TimeUnit.MILLISECONDS));
         builder.followRedirects(key.autoRedirects);
