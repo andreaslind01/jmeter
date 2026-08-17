@@ -115,6 +115,28 @@ class TestHTTPOkFeatures extends JMeterTestCase {
     }
 
     @Test
+    void latencyDoesNotExceedElapsedTimeForDribbledHttp2Response() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false));
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/http2dribbled"))
+                    .willReturn(aResponse().withStatus(200).withBody(new byte[10_000]).withChunkedDribbleDelay(5, 500)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("https://localhost:" + server.httpsPort() + "/http2dribbled"), HTTPConstants.GET, false, 1);
+
+            assertTrue(result.getLatency() <= result.getTime(),
+                    "latency should not exceed elapsed time");
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
     void fallsBackToHttp11WhenServerDoesNotSupportHttp2() throws Exception {
         WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
                 .dynamicHttpsPort()
@@ -149,6 +171,26 @@ class TestHTTPOkFeatures extends JMeterTestCase {
 
             assertEquals("200", result.getResponseCode());
             assertEquals("HTTP/1.1", result.getResponseHeaders().substring(0, "HTTP/1.1".length()));
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void latencyDoesNotExceedElapsedTimeForDribbledHttp11Response() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/http11dribbled"))
+                    .willReturn(aResponse().withStatus(200).withBody(new byte[10_000]).withChunkedDribbleDelay(5, 500)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/1.1");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/http11dribbled")), HTTPConstants.GET, false, 1);
+
+            assertTrue(result.getLatency() <= result.getTime(),
+                    "latency should not exceed elapsed time");
         } finally {
             server.stop();
         }

@@ -323,6 +323,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             } finally {
                 SpnegoProxyAuthenticator.clearSubject();
             }
+            readResponse(response, result);
             result.sampleEnd();
             currentCall = null;
 
@@ -568,28 +569,29 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         return "";
     }
 
-    private void updateResult(Response response, Request request, HTTPSampleResult result) throws IOException {
-        result.setRequestHeaders(getRequestHeaders(request));
-        result.setSentBytes(calculateSentBytes(request));
+    private void readResponse(Response response, HTTPSampleResult result) throws IOException {
         String contentType = response.header(HTTPConstants.HEADER_CONTENT_TYPE);
         if (contentType != null) {
             result.setContentType(contentType);
             result.setEncodingAndType(contentType);
         }
         ResponseBody body = response.body();
-        long bodySize = 0;
         if (body != null) {
             byte[] responseData = readResponse(result, body.byteStream(), body.contentLength());
             result.setResponseData(responseData);
-            bodySize = responseData.length;
+            result.setBodySize((long) responseData.length);
         }
+    }
+
+    private void updateResult(Response response, Request request, HTTPSampleResult result) {
+        result.setRequestHeaders(getRequestHeaders(request));
+        result.setSentBytes(calculateSentBytes(request));
         int statusCode = response.code();
         result.setResponseCode(Integer.toString(statusCode));
         result.setResponseMessage(response.message());
         result.setSuccessful(isSuccessCode(statusCode));
         result.setResponseHeaders(getResponseHeaders(response));
         result.setHeadersSize(result.getResponseHeaders().length());
-        result.setBodySize(bodySize);
         if (result.isRedirect()) {
             String location = response.header(HTTPConstants.HEADER_LOCATION);
             if (location != null) {
