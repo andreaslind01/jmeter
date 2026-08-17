@@ -663,11 +663,18 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         result.setSuccessful(isSuccessCode(statusCode));
         result.setResponseHeaders(getResponseHeaders(response));
         result.setHeadersSize(result.getResponseHeaders().length());
+        if (response.priorResponse() != null) {
+            // OkHttp followed the redirects on its own, so the response was sampled from the URL of
+            // the last request. The cookie and the cache manager as well as the listeners need it.
+            result.setURL(request.url().url());
+        }
         if (result.isRedirect()) {
             String location = response.header(HTTPConstants.HEADER_LOCATION);
-            if (location != null) {
-                result.setRedirectLocation(location);
+            if (location == null) { // HTTP protocol violation, but avoids NPE
+                throw new IllegalArgumentException(
+                        "Missing location header in redirect for " + request.method() + " " + request.url());
             }
+            result.setRedirectLocation(location);
         }
     }
 
