@@ -96,6 +96,7 @@ import okhttp3.Response;
 import okhttp3.ResponseBody;
 import okio.Buffer;
 import okio.BufferedSink;
+import okio.BufferedSource;
 import okio.ByteString;
 import okio.GzipSource;
 import okio.InflaterSource;
@@ -269,24 +270,26 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             return response;
         }
         encoding = encoding.toLowerCase(Locale.ROOT);
-        if ("gzip".equals(encoding) || "x-gzip".equals(encoding)) {
-            GzipSource gzipSource = new GzipSource(body.source());
-            return response.newBuilder()
-                    .body(ResponseBody.create(Okio.buffer(gzipSource), body.contentType(), -1L))
-                    .build();
-        } else if ("deflate".equals(encoding)) {
-            InflaterSource inflaterSource = new InflaterSource(body.source(), new Inflater(true));
-            return response.newBuilder()
-                    .body(ResponseBody.create(Okio.buffer(inflaterSource), body.contentType(), -1L))
-                    .build();
-        } else if ("br".equals(encoding)) {
-            BrotliInputStream brotliStream = new BrotliInputStream(body.byteStream());
-            Source source = Okio.source(brotliStream);
-            return response.newBuilder()
-                    .body(ResponseBody.create(Okio.buffer(source), body.contentType(), -1L))
-                    .build();
+        boolean gzip = "gzip".equals(encoding) || "x-gzip".equals(encoding);
+        boolean deflate = "deflate".equals(encoding);
+        boolean brotli = "br".equals(encoding);
+        if (!gzip && !deflate && !brotli) {
+            return response;
         }
-        return response;
+        // The bytes are counted before they are decoded, so the sample result reports the size the
+        // response had on the wire, like the HttpClient and the Java based implementations do
+        CountingInputStream wireBytes = new CountingInputStream(body.byteStream());
+        Source decoded;
+        if (gzip) {
+            decoded = new GzipSource(Okio.buffer(Okio.source(wireBytes)));
+        } else if (deflate) {
+            decoded = new InflaterSource(Okio.buffer(Okio.source(wireBytes)), new Inflater(true));
+        } else {
+            decoded = Okio.source(new BrotliInputStream(wireBytes));
+        }
+        return response.newBuilder()
+                .body(new CountingResponseBody(Okio.buffer(decoded), body.contentType(), wireBytes))
+                .build();
     };
 
     private volatile Call currentCall;
@@ -542,6 +545,44 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
     }
 
     /**
+     * Decoded response body which remembers how many bytes were read from the network before they
+     * were decompressed, so the sample result can report the size the response had on the wire
+     * instead of the size it expanded to.
+     */
+    private static final class CountingResponseBody extends ResponseBody {
+        private final BufferedSource source;
+        private final MediaType contentType;
+        private final CountingInputStream wireBytes;
+
+        private CountingResponseBody(BufferedSource source, MediaType contentType,
+                CountingInputStream wireBytes) {
+            this.source = source;
+            this.contentType = contentType;
+            this.wireBytes = wireBytes;
+        }
+
+        @Override
+        public MediaType contentType() {
+            return contentType;
+        }
+
+        @Override
+        public long contentLength() {
+            // The decoded length is unknown until the body has been read
+            return -1L;
+        }
+
+        @Override
+        public BufferedSource source() {
+            return source;
+        }
+
+        private long getBytesRead() {
+            return wireBytes.getBytesRead();
+        }
+    }
+
+    /**
      * File upload that can write a placeholder instead of the content of the file, so that the
      * request view can be built without reading the file into memory. The announced content length
      * is always the length of the file, as the body is only rendered with the placeholder while the
@@ -645,12 +686,19 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         }
         ResponseBody body = response.body();
         if (body != null) {
-            // The stored response is truncated when httpsampler.max_bytes_to_store_per_request is
-            // set, so the body is counted while it is read to report what the server actually sent
-            CountingInputStream countingStream = new CountingInputStream(body.byteStream());
-            byte[] responseData = readResponse(result, countingStream, body.contentLength());
-            result.setResponseData(responseData);
-            result.setBodySize(countingStream.getBytesRead());
+            if (body instanceof CountingResponseBody countingBody) {
+                // The compressed bytes were already counted before the body was decoded
+                byte[] responseData = readResponse(result, body.byteStream(), body.contentLength());
+                result.setResponseData(responseData);
+                result.setBodySize(countingBody.getBytesRead());
+            } else {
+                // The stored response is truncated when httpsampler.max_bytes_to_store_per_request is
+                // set, so the body is counted while it is read to report what the server actually sent
+                CountingInputStream countingStream = new CountingInputStream(body.byteStream());
+                byte[] responseData = readResponse(result, countingStream, body.contentLength());
+                result.setResponseData(responseData);
+                result.setBodySize(countingStream.getBytesRead());
+            }
         }
     }
 
@@ -662,7 +710,15 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         result.setResponseMessage(response.message());
         result.setSuccessful(isSuccessCode(statusCode));
         result.setResponseHeaders(getResponseHeaders(response));
-        result.setHeadersSize(result.getResponseHeaders().length());
+        // Approximated the way HTTPHC4Impl does it, so all implementations report the same size:
+        // the condensed headers (without \r), a \r per header, a \r for the status line and the
+        // final \r\n before the body
+        long headerBytes =
+                (long) result.getResponseHeaders().length()
+                + response.headers().size()
+                + 1L
+                + 2L;
+        result.setHeadersSize((int) headerBytes);
         if (response.priorResponse() != null) {
             // OkHttp followed the redirects on its own, so the response was sampled from the URL of
             // the last request. The cookie and the cache manager as well as the listeners need it.
