@@ -17,7 +17,6 @@
 
 package org.apache.jmeter.protocol.http.sampler;
 
-import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -35,11 +34,9 @@ import java.net.URLConnection;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.security.KeyManagementException;
+import java.nio.file.Path;
 import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -49,29 +46,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BiFunction;
 import java.util.function.Predicate;
 import java.util.zip.GZIPInputStream;
 
-import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLContextSpi;
-import javax.net.ssl.SSLEngine;
-import javax.net.ssl.SSLEngineResult;
-import javax.net.ssl.SSLException;
-import javax.net.ssl.SSLParameters;
-import javax.net.ssl.SSLServerSocketFactory;
-import javax.net.ssl.SSLSession;
-import javax.net.ssl.SSLSessionContext;
-import javax.net.ssl.SSLSocketFactory;
-import javax.net.ssl.TrustManager;
 
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.Authorization;
@@ -395,6 +380,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
     private transient PostWriter postOrPutWriter;
 
     private volatile HttpURLConnection savedConn;
+    private volatile CompletableFuture<HttpResponse<InputStream>> currentResponseFuture;
 
     protected HTTPJavaImpl(HTTPSamplerBase base) {
         super(base);
@@ -1087,11 +1073,16 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
     @Override
     public boolean interrupt() {
         HttpURLConnection conn = savedConn;
+        CompletableFuture<HttpResponse<InputStream>> responseFuture = currentResponseFuture;
+        savedConn = null;
+        currentResponseFuture = null;
         if (conn != null) {
-            savedConn = null;
             conn.disconnect();
         }
-        return conn != null;
+        if (responseFuture != null) {
+            responseFuture.cancel(true);
+        }
+        return conn != null || responseFuture != null;
     }
 
     private HTTPSampleResult sampleHttp2(URL url, String method, boolean areFollowingRedirect, int frameDepth) {
@@ -1099,58 +1090,63 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
             log.debug("Start : sampleHttp2 {}, method {}, followingRedirect {}, depth {}",
                     url, method, areFollowingRedirect, frameDepth);
         }
-
         HTTPSampleResult res = new HTTPSampleResult();
         configureSampleLabel(res, url);
         res.setURL(url);
         res.setHTTPMethod(method);
-
         res.sampleStart();
-
         final CacheManager cacheManager = getCacheManager();
         if (cacheManager != null && HTTPConstants.GET.equalsIgnoreCase(method)) {
             if (cacheManager.inCache(url, getHeaders(getHeaderManager()))) {
                 return updateSampleResultForResourceInCache(res);
             }
         }
-
-        CapturingHttpURLConnection capturingConn = null;
-        byte[] requestBodyBytes = new byte[0];
+        Http2CapturingHttpURLConnection capturingConn = null;
+        Path requestBody = null;
+        byte[] postBodyBytes = null;
+        long requestBodyLength = -1;
         Map<String, String> securityHeaders = Collections.emptyMap();
-
         try {
-            capturingConn = new CapturingHttpURLConnection(url, method);
-
+            capturingConn = new Http2CapturingHttpURLConnection(url, method);
             securityHeaders = setConnectionHeaders(capturingConn, url, getHeaderManager(), getCacheManager());
             String cookies = setConnectionCookie(capturingConn, url, getCookieManager());
             setConnectionAuthorization(capturingConn, url, getAuthManager(), securityHeaders);
             setDefaultUserAgent(capturingConn, HTTP_2_DEFAULT_USER_AGENT);
-
             if (method.equals(HTTPConstants.POST)) {
                 setPostHeaders(capturingConn);
                 String postBody = sendPostData(capturingConn);
                 res.setQueryString(postBody);
-                requestBodyBytes = capturingConn.getCapturedBytes();
             } else if (method.equals(HTTPConstants.PUT)) {
                 setPutHeaders(capturingConn);
                 String putBody = sendPutData(capturingConn);
                 res.setQueryString(putBody);
-                requestBodyBytes = capturingConn.getCapturedBytes();
             }
-
+            capturingConn.finishCapture();
+            requestBodyLength = capturingConn.getCapturedBodyLength();
+            if (capturingConn.isSpilled()) {
+                requestBody = capturingConn.getCapturedBody();
+            } else {
+                postBodyBytes = capturingConn.getCapturedByteArray();
+            }
             res.setRequestHeaders(getAllHeadersExceptCookie(capturingConn, securityHeaders));
             if (StringUtilities.isNotEmpty(cookies)) {
                 res.setCookies(cookies);
             } else {
                 res.setCookies(getOnlyCookieFromHeaders(capturingConn, securityHeaders));
             }
-
             URI uri = url.toURI();
             HttpRequest.Builder reqBuilder = HttpRequest.newBuilder(uri);
-
             if (method.equalsIgnoreCase(HTTPConstants.POST) || method.equalsIgnoreCase(HTTPConstants.PUT)
                     || method.equalsIgnoreCase(HTTPConstants.PATCH)) {
-                reqBuilder.method(method, HttpRequest.BodyPublishers.ofByteArray(requestBodyBytes));
+                HttpRequest.BodyPublisher publisher;
+                if (requestBody != null) {
+                    publisher = HttpRequest.BodyPublishers.ofFile(requestBody);
+                } else if (postBodyBytes != null) {
+                    publisher = HttpRequest.BodyPublishers.ofByteArray(postBodyBytes);
+                } else {
+                    publisher = HttpRequest.BodyPublishers.noBody();
+                }
+                reqBuilder.method(method, publisher);
             } else if (method.equalsIgnoreCase(HTTPConstants.GET)) {
                 reqBuilder.GET();
             } else if (method.equalsIgnoreCase(HTTPConstants.DELETE)) {
@@ -1158,12 +1154,10 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
             } else {
                 reqBuilder.method(method, HttpRequest.BodyPublishers.noBody());
             }
-
             int rto = getResponseTimeout();
             if (rto > 0) {
                 reqBuilder.timeout(Duration.ofMillis(rto));
             }
-
             Map<String, List<String>> props = capturingConn.getRequestProperties();
             for (Map.Entry<String, List<String>> entry : props.entrySet()) {
                 String headerName = entry.getKey();
@@ -1174,15 +1168,24 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
                     reqBuilder.header(headerName, value);
                 }
             }
-
             Http2Client client = getHttpClient(url);
             HttpRequest httpRequest = reqBuilder.build();
-
             HttpResponse<InputStream> response;
             ConnectTimeTracker connectTimeTracker = client.connectTimeTracker;
-            connectTimeTracker.sampleStarted(res);
+            connectTimeTracker.sampleStarted(res, ConnectTimeTracker.origin(url));
             try {
-                response = client.httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+                CompletableFuture<HttpResponse<InputStream>> responseFuture =
+                        client.httpClient.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+                currentResponseFuture = responseFuture;
+                try {
+                    response = responseFuture.get();
+                } catch (InterruptedException e) {
+                    responseFuture.cancel(true);
+                    Thread.currentThread().interrupt();
+                    throw e;
+                } finally {
+                    currentResponseFuture = null;
+                }
             } finally {
                 connectTimeTracker.sampleFinished(res);
             }
@@ -1193,21 +1196,17 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
             res.sampleEnd();
 
             res.setResponseData(responseData);
-
             int statusCode = response.statusCode();
             res.setResponseCode(Integer.toString(statusCode));
             res.setSuccessful(isSuccessCode(statusCode));
             res.setResponseMessage(getReasonPhrase(statusCode));
-
             String responseHeaders = getResponseHeaders(response);
             res.setResponseHeaders(responseHeaders);
-
             String ct = response.headers().firstValue(HTTPConstants.HEADER_CONTENT_TYPE).orElse(null);
             if (ct != null) {
                 res.setContentType(ct);
                 res.setEncodingAndType(ct);
             }
-
             if (res.isRedirect()) {
                 String location = response.headers().firstValue(HTTPConstants.HEADER_LOCATION).orElse(null);
                 if (location != null) {
@@ -1232,7 +1231,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
 
             res.setSentBytes(calculateSentBytes(url, method, HTTPConstants.HTTP_2,
                     capturingConn != null ? capturingConn.getRequestProperties() : null,
-                    securityHeaders, requestBodyBytes));
+                    securityHeaders, requestBodyLength));
 
             res = resultProcessing(areFollowingRedirect, frameDepth, res);
 
@@ -1244,8 +1243,12 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
             }
             res.setSentBytes(calculateSentBytes(url, method, HTTPConstants.HTTP_2,
                     capturingConn != null ? capturingConn.getRequestProperties() : null,
-                    securityHeaders, requestBodyBytes));
+                    securityHeaders, requestBodyLength));
             return errorResult(e, res);
+        } finally {
+            if (capturingConn != null) {
+                capturingConn.deleteCapturedBody();
+            }
         }
     }
 
@@ -1320,6 +1323,17 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
             Map<String, List<String>> requestHeaders,
             Map<String, String> securityHeaders,
             byte[] postBodyBytes) {
+        return calculateSentBytes(u, method, version, requestHeaders, securityHeaders,
+                postBodyBytes == null ? -1 : postBodyBytes.length);
+    }
+
+    private static long calculateSentBytes(
+            URL u,
+            String method,
+            String version,
+            Map<String, List<String>> requestHeaders,
+            Map<String, String> securityHeaders,
+            long postBodyLength) {
         long sentBytes = 0;
 
         if (StringUtilities.isBlank(method)) {
@@ -1382,8 +1396,8 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
         sentBytes += 2;
 
         // Request body
-        if (postBodyBytes != null && postBodyBytes.length > 0) {
-            sentBytes += postBodyBytes.length;
+        if (postBodyLength >= 0) {
+            sentBytes += postBodyLength;
         } else if (requestHeaders != null) {
             String contentLengthStr = getHeaderValue(requestHeaders, HTTPConstants.HEADER_CONTENT_LENGTH);
             if (StringUtilities.isNotEmpty(contentLengthStr)) {
@@ -1492,7 +1506,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
         ConnectTimeTracker connectTimeTracker = new ConnectTimeTracker();
         HttpClient.Builder builder = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_2)
-                .executor(new ConnectTimeMeasuringExecutor(connectTimeTracker))
+                .executor(http2Executor())
                 .followRedirects(key.autoRedirects ? HttpClient.Redirect.NORMAL : HttpClient.Redirect.NEVER);
 
         if (key.connectTimeout > 0) {
@@ -1516,7 +1530,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
         }
 
         if (sslContext != null) {
-            builder.sslContext(new ConnectTimeMeasuringSSLContext(sslContext, connectTimeTracker));
+            builder.sslContext(new ConnectTimeTracker.MeasuringSSLContext(sslContext, connectTimeTracker));
         }
 
         return new Http2Client(builder.build(), connectTimeTracker, sslContext);
@@ -1541,72 +1555,6 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
         }
     }
 
-    /**
-     * Records the connect time of the JDK {@link HttpClient} in the {@link SampleResult}s which are in flight.
-     * <p>
-     * The JDK client does not expose a hook for connection establishment, so two indicators are used:
-     * the client submits its first task to the executor once the TCP connection has been established, and
-     * the wrapped {@code SSLEngine} reports when the TLS handshake has been finished. The TLS handshake
-     * always wins, since it is the more precise and the later event.
-     * <p>
-     * A multiplexed client is shared by several threads, so more than one sample can be in flight. Since the
-     * connection is established for all of them at once, the connect time is recorded in every sample which
-     * is waiting for it.
-     */
-    static final class ConnectTimeTracker {
-        private static final Integer NOTHING_RECORDED = 0;
-        private static final Integer CONNECT_RECORDED = 1;
-        private static final Integer HANDSHAKE_RECORDED = 2;
-
-        /** Samples which are currently in flight, together with the connect event recorded for them. */
-        private final Map<SampleResult, Integer> activeSamples = new ConcurrentHashMap<>();
-
-        void sampleStarted(SampleResult result) {
-            activeSamples.put(result, NOTHING_RECORDED);
-        }
-
-        void sampleFinished(SampleResult result) {
-            activeSamples.remove(result);
-        }
-
-        /** Invoked when the TCP connection has been established. */
-        void connectionEstablished() {
-            recordConnectEnd(CONNECT_RECORDED);
-        }
-
-        /** Invoked when the TLS handshake has been finished, it overrides the plain TCP connect time. */
-        void handshakeFinished() {
-            recordConnectEnd(HANDSHAKE_RECORDED);
-        }
-
-        private void recordConnectEnd(Integer event) {
-            activeSamples.replaceAll((result, recorded) -> {
-                if (recorded.intValue() >= event.intValue()) {
-                    return recorded;
-                }
-                result.connectEnd();
-                return event;
-            });
-        }
-    }
-
-    /**
-     * Executor which notifies the {@link ConnectTimeTracker} before delegating to the shared thread pool.
-     */
-    private static final class ConnectTimeMeasuringExecutor implements Executor {
-        private final ConnectTimeTracker tracker;
-
-        ConnectTimeMeasuringExecutor(ConnectTimeTracker tracker) {
-            this.tracker = tracker;
-        }
-
-        @Override
-        public void execute(Runnable command) {
-            tracker.connectionEstablished();
-            http2Executor().execute(command);
-        }
-    }
-
     private static final class Http2ThreadFactory implements ThreadFactory {
         private final AtomicInteger counter = new AtomicInteger();
 
@@ -1615,255 +1563,6 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
             Thread thread = new Thread(r, "JMeter-HTTP2-" + counter.incrementAndGet()); // $NON-NLS-1$
             thread.setDaemon(true);
             return thread;
-        }
-    }
-
-    /**
-     * {@link SSLContext} which creates {@link SSLEngine}s that report the end of the TLS handshake.
-     */
-    static final class ConnectTimeMeasuringSSLContext extends SSLContext {
-        ConnectTimeMeasuringSSLContext(SSLContext delegate, ConnectTimeTracker tracker) {
-            super(new ConnectTimeMeasuringSSLContextSpi(delegate, tracker), delegate.getProvider(),
-                    delegate.getProtocol());
-        }
-    }
-
-    private static final class ConnectTimeMeasuringSSLContextSpi extends SSLContextSpi {
-        private final SSLContext delegate;
-        private final ConnectTimeTracker tracker;
-
-        ConnectTimeMeasuringSSLContextSpi(SSLContext delegate, ConnectTimeTracker tracker) {
-            this.delegate = delegate;
-            this.tracker = tracker;
-        }
-
-        @Override
-        protected void engineInit(KeyManager[] km, TrustManager[] tm, SecureRandom sr) throws KeyManagementException {
-            delegate.init(km, tm, sr);
-        }
-
-        @Override
-        protected SSLSocketFactory engineGetSocketFactory() {
-            return delegate.getSocketFactory();
-        }
-
-        @Override
-        protected SSLServerSocketFactory engineGetServerSocketFactory() {
-            return delegate.getServerSocketFactory();
-        }
-
-        @Override
-        protected SSLEngine engineCreateSSLEngine() {
-            return new ConnectTimeMeasuringSSLEngine(delegate.createSSLEngine(), tracker);
-        }
-
-        @Override
-        protected SSLEngine engineCreateSSLEngine(String host, int port) {
-            return new ConnectTimeMeasuringSSLEngine(delegate.createSSLEngine(host, port), tracker);
-        }
-
-        @Override
-        protected SSLSessionContext engineGetServerSessionContext() {
-            return delegate.getServerSessionContext();
-        }
-
-        @Override
-        protected SSLSessionContext engineGetClientSessionContext() {
-            return delegate.getClientSessionContext();
-        }
-
-        @Override
-        protected SSLParameters engineGetDefaultSSLParameters() {
-            return delegate.getDefaultSSLParameters();
-        }
-
-        @Override
-        protected SSLParameters engineGetSupportedSSLParameters() {
-            return delegate.getSupportedSSLParameters();
-        }
-    }
-
-    /**
-     * {@link SSLEngine} which delegates all calls and notifies the {@link ConnectTimeTracker}
-     * as soon as the TLS handshake has been finished.
-     */
-    static final class ConnectTimeMeasuringSSLEngine extends SSLEngine {
-        private final SSLEngine delegate;
-        private final ConnectTimeTracker tracker;
-
-        ConnectTimeMeasuringSSLEngine(SSLEngine delegate, ConnectTimeTracker tracker) {
-            super(delegate.getPeerHost(), delegate.getPeerPort());
-            this.delegate = delegate;
-            this.tracker = tracker;
-        }
-
-        private void checkHandshakeFinished(SSLEngineResult result) {
-            if (result.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.FINISHED) {
-                tracker.handshakeFinished();
-            }
-        }
-
-        @Override
-        public SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst) throws SSLException {
-            SSLEngineResult result = delegate.wrap(srcs, offset, length, dst);
-            checkHandshakeFinished(result);
-            return result;
-        }
-
-        @Override
-        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) throws SSLException {
-            SSLEngineResult result = delegate.unwrap(src, dsts, offset, length);
-            checkHandshakeFinished(result);
-            return result;
-        }
-
-        @Override
-        public Runnable getDelegatedTask() {
-            return delegate.getDelegatedTask();
-        }
-
-        @Override
-        public void closeInbound() throws SSLException {
-            delegate.closeInbound();
-        }
-
-        @Override
-        public boolean isInboundDone() {
-            return delegate.isInboundDone();
-        }
-
-        @Override
-        public void closeOutbound() {
-            delegate.closeOutbound();
-        }
-
-        @Override
-        public boolean isOutboundDone() {
-            return delegate.isOutboundDone();
-        }
-
-        @Override
-        public String[] getSupportedCipherSuites() {
-            return delegate.getSupportedCipherSuites();
-        }
-
-        @Override
-        public String[] getEnabledCipherSuites() {
-            return delegate.getEnabledCipherSuites();
-        }
-
-        @Override
-        public void setEnabledCipherSuites(String[] suites) {
-            delegate.setEnabledCipherSuites(suites);
-        }
-
-        @Override
-        public String[] getSupportedProtocols() {
-            return delegate.getSupportedProtocols();
-        }
-
-        @Override
-        public String[] getEnabledProtocols() {
-            return delegate.getEnabledProtocols();
-        }
-
-        @Override
-        public void setEnabledProtocols(String[] protocols) {
-            delegate.setEnabledProtocols(protocols);
-        }
-
-        @Override
-        public SSLSession getSession() {
-            return delegate.getSession();
-        }
-
-        @Override
-        public SSLSession getHandshakeSession() {
-            return delegate.getHandshakeSession();
-        }
-
-        @Override
-        public void beginHandshake() throws SSLException {
-            delegate.beginHandshake();
-        }
-
-        @Override
-        public SSLEngineResult.HandshakeStatus getHandshakeStatus() {
-            return delegate.getHandshakeStatus();
-        }
-
-        @Override
-        public void setUseClientMode(boolean mode) {
-            delegate.setUseClientMode(mode);
-        }
-
-        @Override
-        public boolean getUseClientMode() {
-            return delegate.getUseClientMode();
-        }
-
-        @Override
-        public void setNeedClientAuth(boolean need) {
-            delegate.setNeedClientAuth(need);
-        }
-
-        @Override
-        public boolean getNeedClientAuth() {
-            return delegate.getNeedClientAuth();
-        }
-
-        @Override
-        public void setWantClientAuth(boolean want) {
-            delegate.setWantClientAuth(want);
-        }
-
-        @Override
-        public boolean getWantClientAuth() {
-            return delegate.getWantClientAuth();
-        }
-
-        @Override
-        public void setEnableSessionCreation(boolean flag) {
-            delegate.setEnableSessionCreation(flag);
-        }
-
-        @Override
-        public boolean getEnableSessionCreation() {
-            return delegate.getEnableSessionCreation();
-        }
-
-        @Override
-        public SSLParameters getSSLParameters() {
-            return delegate.getSSLParameters();
-        }
-
-        @Override
-        public void setSSLParameters(SSLParameters params) {
-            delegate.setSSLParameters(params);
-        }
-
-        @Override
-        public String getApplicationProtocol() {
-            return delegate.getApplicationProtocol();
-        }
-
-        @Override
-        public String getHandshakeApplicationProtocol() {
-            return delegate.getHandshakeApplicationProtocol();
-        }
-
-        @Override
-        public void setHandshakeApplicationProtocolSelector(BiFunction<SSLEngine, List<String>, String> selector) {
-            if (selector == null) {
-                delegate.setHandshakeApplicationProtocolSelector(null);
-            } else {
-                delegate.setHandshakeApplicationProtocolSelector((engine, protocols) -> selector.apply(this, protocols));
-            }
-        }
-
-        @Override
-        public BiFunction<SSLEngine, List<String>, String> getHandshakeApplicationProtocolSelector() {
-            return delegate.getHandshakeApplicationProtocolSelector();
         }
     }
 
@@ -1911,90 +1610,4 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
         }
     }
 
-    private static class CapturingHttpURLConnection extends HttpURLConnection {
-        private final Map<String, List<String>> requestProperties = new LinkedHashMap<>();
-        private final ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-
-        CapturingHttpURLConnection(URL url, String method) {
-            super(url);
-            this.method = method;
-        }
-
-        @Override
-        public void setRequestProperty(String key, String value) {
-            if (key == null) {
-                return;
-            }
-            List<String> list = new ArrayList<>();
-            list.add(value);
-            requestProperties.put(key, list);
-        }
-
-        @Override
-        public void addRequestProperty(String key, String value) {
-            if (key == null) {
-                return;
-            }
-            requestProperties.computeIfAbsent(key, k -> new ArrayList<>()).add(value);
-        }
-
-        @Override
-        public String getRequestProperty(String key) {
-            if (key == null) {
-                return null;
-            }
-            List<String> values = requestProperties.get(key);
-            if (values == null || values.isEmpty()) {
-                for (Map.Entry<String, List<String>> entry : requestProperties.entrySet()) {
-                    if (key.equalsIgnoreCase(entry.getKey())) {
-                        values = entry.getValue();
-                        break;
-                    }
-                }
-            }
-            return (values != null && !values.isEmpty()) ? values.get(0) : null;
-        }
-
-        @Override
-        public Map<String, List<String>> getRequestProperties() {
-            return Collections.unmodifiableMap(requestProperties);
-        }
-
-        @Override
-        public java.io.OutputStream getOutputStream() throws IOException {
-            return outputStream;
-        }
-
-        byte[] getCapturedBytes() {
-            return outputStream.toByteArray();
-        }
-
-        @Override
-        public void connect() throws IOException {
-        }
-
-        @Override
-        public void disconnect() {
-        }
-
-        @Override
-        public boolean usingProxy() {
-            return false;
-        }
-
-        @Override
-        public String getHeaderField(int n) {
-            return null;
-        }
-
-        @Override
-        public String getHeaderFieldKey(int n) {
-            return null;
-        }
-
-        @Override
-        public String getHeaderField(String name) {
-            return null;
-        }
-    }
 }

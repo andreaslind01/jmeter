@@ -22,6 +22,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -31,11 +32,12 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.Socket;
-import java.net.URI;
 import java.net.URL;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -56,6 +58,7 @@ import javax.net.ssl.X509ExtendedTrustManager;
 import org.apache.jmeter.protocol.http.control.Header;
 import org.apache.jmeter.protocol.http.control.HeaderManager;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
+import org.apache.jmeter.protocol.http.util.HTTPFileArg;
 import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.util.JsseSSLManager;
 import org.apache.jmeter.util.SSLManager;
@@ -95,9 +98,70 @@ class TestHTTPJavaFeatures {
             HTTPSampleResult result = sampler.sample(
                     new URL(server.url("/http2")), HTTPConstants.GET, false, 1);
 
-            assertEquals("200", result.getResponseCode());
+            assertEquals("200", result.getResponseCode(), result.getResponseMessage());
             assertEquals("HTTP/2", result.getResponseHeaders().substring(0, "HTTP/2".length()));
         } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void uploadsMultipartFileOverHttp2() throws Exception {
+        WireMockServer server = createServer();
+        Path upload = Files.createTempFile("jmeter-http2-upload-", ".bin");
+        try {
+            Files.write(upload, new byte[1_000_000]);
+            server.start();
+            server.stubFor(post(urlEqualTo("/upload")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+            sampler.setMethod(HTTPConstants.POST);
+            sampler.setDoMultipart(true);
+            sampler.setHTTPFiles(new HTTPFileArg[] {
+                    new HTTPFileArg(upload.toString(), "upload", "application/octet-stream") });
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/upload")), HTTPConstants.POST, false, 1);
+
+            assertEquals("200", result.getResponseCode(), result.getResponseMessage());
+            assertTrue(result.getSentBytes() > 1_000_000,
+                    () -> "the whole file should have been sent, but only " + result.getSentBytes() + " bytes were");
+            // The request view must not hold the file contents, otherwise a large upload is in heap twice
+            assertTrue(result.getQueryString().contains("<actual file content, not shown here>"),
+                    () -> "file contents should be omitted from the request view: " + result.getQueryString());
+            server.verify(postRequestedFor(urlEqualTo("/upload")));
+        } finally {
+            Files.deleteIfExists(upload);
+            server.stop();
+        }
+    }
+
+    @Test
+    void interruptsPendingHttp2Request() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            server.stubFor(get(urlEqualTo("/interrupted")).willReturn(aResponse().withFixedDelay(10_000)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+            HTTPJavaImpl implementation = new HTTPJavaImpl(sampler);
+
+            Future<?> sample = executor.submit(() -> implementation.sample(
+                    new URL(server.url("/interrupted")), HTTPConstants.GET, false, 1));
+
+            boolean interrupted = false;
+            for (int attempt = 0; attempt < 100 && !interrupted; attempt++) {
+                interrupted = implementation.interrupt();
+                if (!interrupted) {
+                    Thread.sleep(10);
+                }
+            }
+
+            assertTrue(interrupted, "the HTTP/2 response future should be cancellable");
+            sample.get(5, TimeUnit.SECONDS);
+        } finally {
+            executor.shutdownNow();
             server.stop();
         }
     }
@@ -224,17 +288,18 @@ class TestHTTPJavaFeatures {
     }
 
     @Test
-    void recordsConnectTimeForEveryMultiplexedSample() throws Exception {
-        HTTPJavaImpl.ConnectTimeTracker tracker = new HTTPJavaImpl.ConnectTimeTracker();
+    void recordsConnectTimeForEverySampleWaitingForTheNewConnection() throws Exception {
+        ConnectTimeTracker tracker = new ConnectTimeTracker();
         SampleResult first = new SampleResult();
         SampleResult second = new SampleResult();
         first.sampleStart();
         second.sampleStart();
-        tracker.sampleStarted(first);
-        tracker.sampleStarted(second);
+        tracker.sampleStarted(first, "example.com:443");
+        tracker.sampleStarted(second, "example.com:443");
 
+        ConnectTimeTracker.Connection connection = tracker.connectionOpened("example.com:443");
         Thread.sleep(5);
-        tracker.connectionEstablished();
+        connection.established();
         Thread.sleep(5);
 
         first.sampleEnd();
@@ -249,14 +314,78 @@ class TestHTTPJavaFeatures {
     }
 
     @Test
-    void ignoresSamplesWhichAreNoLongerInFlight() {
-        HTTPJavaImpl.ConnectTimeTracker tracker = new HTTPJavaImpl.ConnectTimeTracker();
+    void doesNotRecordConnectTimeOfAConnectionToAnotherOrigin() throws Exception {
+        ConnectTimeTracker tracker = new ConnectTimeTracker();
         SampleResult result = new SampleResult();
         result.sampleStart();
-        tracker.sampleStarted(result);
+        tracker.sampleStarted(result, "a.example:443");
+
+        Thread.sleep(5);
+        // Another JMeter thread opens a connection to a different host over the shared client
+        tracker.connectionOpened("b.example:443").established();
+
+        result.sampleEnd();
         tracker.sampleFinished(result);
 
-        tracker.connectionEstablished();
+        assertEquals(0, result.getConnectTime(),
+                "the connect time of another origin must not be reported for this sample");
+    }
+
+    @Test
+    void doesNotRecordConnectTimeForSampleServedByAnEstablishedConnection() throws Exception {
+        ConnectTimeTracker tracker = new ConnectTimeTracker();
+        tracker.connectionOpened("example.com:443").established();
+
+        SampleResult result = new SampleResult();
+        result.sampleStart();
+        tracker.sampleStarted(result, "example.com:443");
+        Thread.sleep(5);
+        result.sampleEnd();
+        tracker.sampleFinished(result);
+
+        assertEquals(0, result.getConnectTime(),
+                "a sample multiplexed over an established connection did not connect");
+    }
+
+    @Test
+    void recordsConnectTimeOfOneConnectionPerSampleOnly() throws Exception {
+        ConnectTimeTracker tracker = new ConnectTimeTracker();
+        SampleResult result = new SampleResult();
+        result.sampleStart();
+        tracker.sampleStarted(result, "example.com:443");
+
+        Thread.sleep(5);
+        tracker.connectionOpened("example.com:443").established();
+        long firstConnection = result.getConnectTime();
+        Thread.sleep(300);
+        // A connection opened afterwards belongs to another sample, it must not overwrite the measurement
+        tracker.connectionOpened("example.com:443").established();
+
+        result.sampleEnd();
+        tracker.sampleFinished(result);
+
+        assertEquals(0, firstConnection, "the sample result should only be written by its own thread");
+        assertTrue(result.getConnectTime() > 0, "connectTime should have been recorded");
+        assertTrue(result.getConnectTime() < 150,
+                "connectTime should be the one of the first connection, but was " + result.getConnectTime());
+    }
+
+    @Test
+    void derivesTheOriginOfASampleFromItsUrl() throws Exception {
+        assertEquals("example.com:443", ConnectTimeTracker.origin(new URL("https://EXAMPLE.com/a")));
+        assertEquals("example.com:80", ConnectTimeTracker.origin(new URL("http://example.com/a")));
+        assertEquals("example.com:8443", ConnectTimeTracker.origin(new URL("https://example.com:8443/a")));
+    }
+
+    @Test
+    void ignoresSamplesWhichAreNoLongerInFlight() {
+        ConnectTimeTracker tracker = new ConnectTimeTracker();
+        SampleResult result = new SampleResult();
+        result.sampleStart();
+        tracker.sampleStarted(result, "example.com:443");
+        tracker.sampleFinished(result);
+
+        tracker.connectionOpened("example.com:443").established();
         result.sampleEnd();
 
         assertEquals(0, result.getConnectTime());
@@ -454,7 +583,7 @@ class TestHTTPJavaFeatures {
     }
 
     @Test
-    void setsConnectTimeForHttp2OverPlainConnection() throws Exception {
+    void doesNotMeasureConnectTimeForPlainTextHttp2() throws Exception {
         WireMockServer server = createServer();
         server.start();
         try {
@@ -466,10 +595,11 @@ class TestHTTPJavaFeatures {
                     new URL(server.url("/http2ConnectTime")), HTTPConstants.GET, false, 1);
 
             assertEquals("200", result.getResponseCode());
-            assertTrue(result.getConnectTime() > 0,
-                    "connectTime should be greater than 0, but was " + result.getConnectTime());
-            assertTrue(result.getConnectTime() <= result.getTime(),
-                    "connectTime should not exceed the elapsed time");
+            // The JDK client only reveals connection establishment through the SSLEngine it creates per
+            // connection, so the connect time of a plain text connection cannot be measured. Guessing it
+            // would report the connect time of unrelated samples of the shared, multiplexed client.
+            assertEquals(0, result.getConnectTime(),
+                    "connect time cannot be measured for plain text HTTP/2, so it must not be guessed");
         } finally {
             server.stop();
         }
@@ -483,22 +613,21 @@ class TestHTTPJavaFeatures {
         try {
             server.stubFor(get(urlEqualTo("/http2TlsConnectTime")).willReturn(aResponse().withStatus(200)));
 
-            HTTPJavaImpl.ConnectTimeTracker tracker = new HTTPJavaImpl.ConnectTimeTracker();
+            ConnectTimeTracker tracker = new ConnectTimeTracker();
             SSLContext sslContext = trustAllContext();
             HttpClient client = HttpClient.newBuilder()
                     .version(HttpClient.Version.HTTP_2)
-                    .sslContext(new HTTPJavaImpl.ConnectTimeMeasuringSSLContext(sslContext, tracker))
+                    .sslContext(new ConnectTimeTracker.MeasuringSSLContext(sslContext, tracker))
                     .build();
+            URL url = new URL("https://localhost:" + server.httpsPort() + "/http2TlsConnectTime");
+            HttpRequest request = HttpRequest.newBuilder(url.toURI()).build();
 
             SampleResult result = new SampleResult();
             result.sampleStart();
-            tracker.sampleStarted(result);
+            tracker.sampleStarted(result, ConnectTimeTracker.origin(url));
             HttpResponse<String> response;
             try {
-                response = client.send(
-                        HttpRequest.newBuilder(URI.create(
-                                "https://localhost:" + server.httpsPort() + "/http2TlsConnectTime")).build(),
-                        HttpResponse.BodyHandlers.ofString());
+                response = client.send(request, HttpResponse.BodyHandlers.ofString());
             } finally {
                 tracker.sampleFinished(result);
             }
@@ -510,6 +639,20 @@ class TestHTTPJavaFeatures {
                     "connectTime should be greater than 0, but was " + result.getConnectTime());
             assertTrue(result.getConnectTime() <= result.getTime(),
                     "connectTime should not exceed the elapsed time");
+
+            // The next sample reuses the established connection, so it did not have to connect
+            SampleResult pooled = new SampleResult();
+            pooled.sampleStart();
+            tracker.sampleStarted(pooled, ConnectTimeTracker.origin(url));
+            try {
+                assertEquals(200, client.send(request, HttpResponse.BodyHandlers.ofString()).statusCode());
+            } finally {
+                tracker.sampleFinished(pooled);
+            }
+            pooled.sampleEnd();
+
+            assertEquals(0, pooled.getConnectTime(),
+                    "a sample served by an established connection must not report a connect time");
         } finally {
             server.stop();
         }
