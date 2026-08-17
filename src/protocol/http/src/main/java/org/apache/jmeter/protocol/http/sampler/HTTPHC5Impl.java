@@ -28,6 +28,7 @@ import java.net.URI;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.security.GeneralSecurityException;
 import java.security.Principal;
@@ -53,6 +54,8 @@ import org.apache.hc.client5.http.HttpRoute;
 import org.apache.hc.client5.http.SystemDefaultDnsResolver;
 import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
 import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
+import org.apache.hc.client5.http.async.methods.SimpleRequestProducer;
+import org.apache.hc.client5.http.async.methods.SimpleResponseConsumer;
 import org.apache.hc.client5.http.auth.AuthSchemeFactory;
 import org.apache.hc.client5.http.auth.AuthScope;
 import org.apache.hc.client5.http.auth.Credentials;
@@ -94,16 +97,19 @@ import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.client5.http.ssl.ClientTlsStrategyBuilder;
 import org.apache.hc.client5.http.ssl.HostnameVerificationPolicy;
 import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
-import org.apache.hc.client5.http.ssl.TrustAllStrategy;
+import org.apache.hc.client5.http.ssl.TlsSocketStrategy;
 import org.apache.hc.core5.concurrent.FutureCallback;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.EntityDetails;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HeaderElement;
 import org.apache.hc.core5.http.HttpEntity;
+import org.apache.hc.core5.http.HttpException;
 import org.apache.hc.core5.http.HttpHeaders;
 import org.apache.hc.core5.http.HttpHost;
 import org.apache.hc.core5.http.HttpRequestInterceptor;
+import org.apache.hc.core5.http.HttpResponse;
 import org.apache.hc.core5.http.HttpVersion;
 import org.apache.hc.core5.http.NameValuePair;
 import org.apache.hc.core5.http.config.Lookup;
@@ -116,6 +122,8 @@ import org.apache.hc.core5.http.message.BasicClassicHttpResponse;
 import org.apache.hc.core5.http.message.BasicHeaderValueParser;
 import org.apache.hc.core5.http.message.BasicNameValuePair;
 import org.apache.hc.core5.http.message.ParserCursor;
+import org.apache.hc.core5.http.nio.AsyncResponseConsumer;
+import org.apache.hc.core5.http.nio.CapacityChannel;
 import org.apache.hc.core5.http.nio.ssl.TlsStrategy;
 import org.apache.hc.core5.http.protocol.HttpContext;
 import org.apache.hc.core5.http2.HttpVersionPolicy;
@@ -123,7 +131,6 @@ import org.apache.hc.core5.http2.config.H2Config;
 import org.apache.hc.core5.io.CloseMode;
 import org.apache.hc.core5.pool.PoolConcurrencyPolicy;
 import org.apache.hc.core5.reactor.ConnectionInitiator;
-import org.apache.hc.core5.ssl.SSLContexts;
 import org.apache.hc.core5.util.TimeValue;
 import org.apache.hc.core5.util.Timeout;
 import org.apache.hc.core5.util.VersionInfo;
@@ -164,6 +171,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     /** Key used to store the current {@link SampleResult} in the {@link HttpClientContext}. */
     static final String CONTEXT_ATTRIBUTE_SAMPLER_RESULT = "__jmeter.S_R__"; //$NON-NLS-1$
+    private static final String CONTEXT_ATTRIBUTE_RESPONSE_LATENCY = "__jmeter.S_R_LATENCY__"; //$NON-NLS-1$
 
     private static final ThreadLocal<Map<HttpClientKey, CloseableHttpClient>> HTTP_CLIENTS =
             new InheritableThreadLocal<>() {
@@ -317,6 +325,15 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     private static final String[] HEADERS_TO_SAVE = {HttpHeaders.CONTENT_LENGTH, HttpHeaders.CONTENT_ENCODING,
             HttpHeaders.CONTENT_MD5};
 
+    private static final String[] SOCKET_PROTOCOL_ARRAY =
+            JMeterUtils.getArrayPropDefault("https.socket.protocols", null);
+
+    private static final String[] SOCKET_CIPHER_ARRAY =
+            JMeterUtils.getArrayPropDefault("https.socket.ciphers", null);
+
+    private static final String[] CIPHER_SUITE_ARRAY =
+            JMeterUtils.getArrayPropDefault("https.cipherSuites", SOCKET_CIPHER_ARRAY);
+
     // HttpClient 5.6 switched BrotliInputStreamFactory to the optional brotli4j library, so decode "br"
     // with the org.brotli:dec library JMeter ships, like HTTPHC4Impl does.
     @SuppressWarnings("deprecation")
@@ -331,8 +348,6 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             .register("x-gzip", GZIPInputStreamFactory.getInstance())
             .register("deflate", DeflateInputStreamFactory.getInstance())
             .build();
-
-    private static final TlsStrategy HTTP_2_TLS_STRATEGY = createHttp2TlsStrategy();
 
     private static final ExecChainHandler RESPONSE_CONTENT_ENCODING = (request, scope, chain) -> {
         HttpClientContext context = scope.clientContext;
@@ -388,20 +403,34 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private volatile org.apache.hc.client5.http.classic.methods.HttpUriRequestBase currentRequest;
 
-    private static TlsStrategy createHttp2TlsStrategy() {
+    private static ClientTlsStrategyBuilder createTlsStrategyBuilder() {
         try {
-            SSLContext sslContext = SSLContexts.custom().loadTrustMaterial(null, TrustAllStrategy.INSTANCE).build();
-            return ClientTlsStrategyBuilder.create()
+            SSLContext sslContext = ((JsseSSLManager) SSLManager.getInstance()).getContext();
+            ClientTlsStrategyBuilder builder = ClientTlsStrategyBuilder.create()
                     .setSslContext(sslContext)
                     // Leave hostname verification to the no-op verifier below. Without CLIENT the policy would
                     // default to BOTH, and the JSSE built-in endpoint identification would reject the
                     // self-signed certificates JMeter deliberately accepts when testing.
                     .setHostVerificationPolicy(HostnameVerificationPolicy.CLIENT)
-                    .setHostnameVerifier(NoopHostnameVerifier.INSTANCE)
-                    .buildAsync();
+                    .setHostnameVerifier(NoopHostnameVerifier.INSTANCE);
+            if (SOCKET_PROTOCOL_ARRAY != null) {
+                builder.setTlsVersions(SOCKET_PROTOCOL_ARRAY);
+            }
+            if (CIPHER_SUITE_ARRAY != null) {
+                builder.setCiphers(CIPHER_SUITE_ARRAY);
+            }
+            return builder;
         } catch (GeneralSecurityException e) {
-            throw new IllegalStateException("Could not create HTTP/2 TLS strategy", e);
+            throw new IllegalStateException("Could not create TLS strategy", e);
         }
+    }
+
+    private static TlsSocketStrategy createTlsSocketStrategy() {
+        return createTlsStrategyBuilder().buildClassic();
+    }
+
+    private static TlsStrategy createTlsStrategy() {
+        return createTlsStrategyBuilder().buildAsync();
     }
 
     static H2Config createHttp2Config() {
@@ -442,6 +471,11 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             HttpClientContext context = createHttpClientContext(url, clientKey, request);
             context.setAttribute(CONTEXT_ATTRIBUTE_SAMPLER_RESULT, result);
             response = executeRequest(url, clientKey, request, context);
+            readResponse(response, result);
+            Long responseLatency = (Long) context.getAttribute(CONTEXT_ATTRIBUTE_RESPONSE_LATENCY);
+            if (responseLatency != null) {
+                result.setLatency(responseLatency);
+            }
             result.sampleEnd();
             currentRequest = null;
 
@@ -889,29 +923,30 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
     }
 
-    private void updateResult(ClassicHttpResponse response,
-            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HTTPSampleResult result) throws IOException {
-        result.setRequestHeaders(getRequestHeaders(request));
-        result.setSentBytes(calculateSentBytes(request));
+    private void readResponse(ClassicHttpResponse response, HTTPSampleResult result) throws IOException {
         Header contentType = response.getFirstHeader(HTTPConstants.HEADER_CONTENT_TYPE);
         if (contentType != null) {
             result.setContentType(contentType.getValue());
             result.setEncodingAndType(contentType.getValue());
         }
         HttpEntity entity = response.getEntity();
-        long bodySize = 0;
         if (entity != null) {
             byte[] body = readResponse(result, entity.getContent(), entity.getContentLength());
             result.setResponseData(body);
-            bodySize = body.length;
+            result.setBodySize((long) body.length);
         }
+    }
+
+    private void updateResult(ClassicHttpResponse response,
+            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HTTPSampleResult result) {
+        result.setRequestHeaders(getRequestHeaders(request));
+        result.setSentBytes(calculateSentBytes(request));
         int statusCode = response.getCode();
         result.setResponseCode(Integer.toString(statusCode));
         result.setResponseMessage(response.getReasonPhrase());
         result.setSuccessful(isSuccessCode(statusCode));
         result.setResponseHeaders(getResponseHeaders(response));
         result.setHeadersSize(result.getResponseHeaders().length());
-        result.setBodySize(bodySize);
         if (result.isRedirect()) {
             Header location = response.getFirstHeader(HTTPConstants.HEADER_LOCATION);
             if (location != null) {
@@ -1046,6 +1081,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             builder.disableDefaultUserAgent();
         }
         PoolingHttpClientConnectionManagerBuilder connectionManagerBuilder = PoolingHttpClientConnectionManagerBuilder.create();
+        connectionManagerBuilder.setTlsSocketStrategy(createTlsSocketStrategy());
         connectionManagerBuilder.setDefaultTlsConfig(TlsConfig.custom()
                 .setVersionPolicy(key.httpVersionPolicy)
                 .build());
@@ -1085,7 +1121,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             builder.addRequestInterceptorLast(REMOVE_DEFAULT_USER_AGENT);
         }
         PoolingAsyncClientConnectionManagerBuilder connectionManagerBuilder = PoolingAsyncClientConnectionManagerBuilder.create();
-        connectionManagerBuilder.setTlsStrategy(HTTP_2_TLS_STRATEGY);
+        connectionManagerBuilder.setTlsStrategy(createTlsStrategy());
         connectionManagerBuilder.setDefaultTlsConfig(TlsConfig.custom()
                 .setVersionPolicy(key.httpVersionPolicy)
                 .build());
@@ -1147,7 +1183,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                     requestEntity.getContentType() == null ? ContentType.DEFAULT_BINARY
                             : ContentType.parse(requestEntity.getContentType()));
         }
-        Future<SimpleHttpResponse> responseFuture = client.execute(asyncRequest, context, null);
+        Future<SimpleHttpResponse> responseFuture = client.execute(SimpleRequestProducer.create(asyncRequest),
+                new LatencyMeasuringResponseConsumer(), context, null);
         try {
             return createClassicResponse(responseFuture.get(getHttp2ExecutionTimeoutMillis(request), TimeUnit.MILLISECONDS));
         } catch (InterruptedException e) {
@@ -1189,6 +1226,54 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                             : asyncResponse.getFirstHeader(HttpHeaders.CONTENT_ENCODING).getValue()));
         }
         return decompressResponse(response);
+    }
+
+    /**
+     * Captures HTTP/2 latency when the final response headers arrive. The response body is buffered
+     * asynchronously, so its later copy through {@link HTTPSamplerBase#readResponse} must not replace this value.
+     */
+    private static final class LatencyMeasuringResponseConsumer implements AsyncResponseConsumer<SimpleHttpResponse> {
+
+        private final SimpleResponseConsumer delegate = SimpleResponseConsumer.create();
+
+        @Override
+        public void consumeResponse(HttpResponse response, EntityDetails entityDetails, HttpContext context,
+                FutureCallback<SimpleHttpResponse> resultCallback) throws HttpException, IOException {
+            SampleResult sampleResult = (SampleResult) context.getAttribute(CONTEXT_ATTRIBUTE_SAMPLER_RESULT);
+            sampleResult.latencyEnd();
+            context.setAttribute(CONTEXT_ATTRIBUTE_RESPONSE_LATENCY, sampleResult.getLatency());
+            delegate.consumeResponse(response, entityDetails, context, resultCallback);
+        }
+
+        @Override
+        public void informationResponse(HttpResponse response, HttpContext context) throws HttpException, IOException {
+            delegate.informationResponse(response, context);
+        }
+
+        @Override
+        public void updateCapacity(CapacityChannel capacityChannel) throws IOException {
+            delegate.updateCapacity(capacityChannel);
+        }
+
+        @Override
+        public void consume(ByteBuffer src) throws IOException {
+            delegate.consume(src);
+        }
+
+        @Override
+        public void streamEnd(List<? extends Header> trailers) throws HttpException, IOException {
+            delegate.streamEnd(trailers);
+        }
+
+        @Override
+        public void failed(Exception cause) {
+            delegate.failed(cause);
+        }
+
+        @Override
+        public void releaseResources() {
+            delegate.releaseResources();
+        }
     }
 
     private static DefaultRoutePlanner createRoutePlanner(HttpClientKey key) {
