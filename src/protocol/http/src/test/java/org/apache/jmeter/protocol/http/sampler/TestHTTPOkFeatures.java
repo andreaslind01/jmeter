@@ -21,6 +21,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -37,6 +38,8 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -51,6 +54,7 @@ import org.apache.jmeter.junit.JMeterTestCase;
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.CacheManager;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
+import org.apache.jmeter.protocol.http.util.HTTPFileArg;
 import org.apache.jmeter.util.JMeterUtils;
 import org.junit.jupiter.api.Test;
 
@@ -790,6 +794,59 @@ class TestHTTPOkFeatures extends JMeterTestCase {
                 .message("Unauthorized")
                 .header("WWW-Authenticate", challenge)
                 .build();
+    }
+
+    @Test
+    void streamsMultipartUploadWithoutReadingTheFileIntoTheRequestView() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        Path upload = Files.createTempFile("jmeter-okhttp-upload-", ".bin");
+        try {
+            byte[] content = new byte[512 * 1024];
+            for (int i = 0; i < content.length; i++) {
+                content[i] = (byte) i;
+            }
+            Files.write(upload, content);
+            server.stubFor(post(urlEqualTo("/multipart")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setDoMultipart(true);
+            sampler.setHTTPFiles(new HTTPFileArg[] {
+                    new HTTPFileArg(upload.toString(), "upload", "application/octet-stream") });
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/multipart")), HTTPConstants.POST, false, 1);
+
+            assertEquals("200", result.getResponseCode());
+            server.verify(postRequestedFor(urlEqualTo("/multipart")));
+            assertTrue(result.getQueryString().contains("<actual file content, not shown here>"),
+                    "the request view must not contain the uploaded file, as it may not fit into the heap");
+            assertTrue(result.getQueryString().length() < content.length,
+                    "the request view must not grow with the size of the uploaded file");
+            assertTrue(result.getSentBytes() > content.length,
+                    "the file is streamed to the server, so it counts towards the sent bytes");
+        } finally {
+            Files.deleteIfExists(upload);
+            server.stop();
+        }
+    }
+
+    @Test
+    void reportsTheBodySizeTheServerSentForATruncatedResponse() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        try {
+            byte[] body = new byte[300_000];
+            server.stubFor(get(urlEqualTo("/large")).willReturn(aResponse().withStatus(200).withBody(body)));
+            HTTPSamplerBase sampler = newSampler();
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL(server.url("/large")), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode());
+            assertEquals(body.length, result.getBodySizeAsLong());
+        } finally {
+            server.stop();
+        }
     }
 
     private static HTTPSamplerBase newSampler() {

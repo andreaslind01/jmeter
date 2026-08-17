@@ -69,6 +69,7 @@ import org.apache.jmeter.util.HttpSSLProtocolSocketFactory;
 import org.apache.jmeter.util.JMeterUtils;
 import org.apache.jmeter.util.JsseSSLManager;
 import org.apache.jmeter.util.SSLManager;
+import org.apache.jorphan.io.CountingInputStream;
 import org.apache.jorphan.util.JOrphanUtils;
 import org.apache.jorphan.util.StringUtilities;
 import org.brotli.dec.BrotliInputStream;
@@ -94,6 +95,8 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
 import okio.Buffer;
+import okio.BufferedSink;
+import okio.ByteString;
 import okio.GzipSource;
 import okio.InflaterSource;
 import okio.Okio;
@@ -459,16 +462,18 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
                     builder.addFormDataPart(name, value);
                 }
             }
+            List<ViewableFileBody> fileBodies = new ArrayList<>(files.length);
             for (HTTPFileArg file : files) {
                 File resolvedFile = FileServer.getFileServer().getResolvedFile(file.getPath());
                 MediaType mediaType = StringUtilities.isNotEmpty(file.getMimeType())
                         ? MediaType.parse(file.getMimeType()) : MediaType.parse("application/octet-stream");
-                RequestBody fileBody = RequestBody.create(resolvedFile, mediaType);
+                ViewableFileBody fileBody = new ViewableFileBody(resolvedFile, mediaType);
+                fileBodies.add(fileBody);
                 builder.addFormDataPart(file.getParamName(), file.getName(), fileBody);
             }
             MultipartBody multipartBody = builder.build();
             requestBody = multipartBody;
-            requestData = getEntityPreview(multipartBody, charset);
+            requestData = getMultipartPreview(multipartBody, fileBodies, charset);
         } else if (!hasArguments() && getSendFileAsPostBody()) {
             HTTPFileArg file = files[0];
             MediaType mediaType = StringUtilities.isNotEmpty(file.getMimeType())
@@ -512,6 +517,69 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         Buffer buffer = new Buffer();
         body.writeTo(buffer);
         return buffer.readString(charset);
+    }
+
+    /**
+     * Renders the multipart body for the request view without the content of the uploaded files.
+     * The files are streamed from disk when the request is sent, so writing them into the preview
+     * would be the only point where an upload is materialized in memory, which fails for a file
+     * that does not fit into the heap.
+     *
+     * @param body the multipart body that is sent
+     * @param fileBodies the parts that carry a file, they are asked to omit their content
+     * @param charset charset the preview is decoded with
+     * @return the multipart body with the file contents replaced by a placeholder
+     * @throws IOException if the body cannot be written
+     */
+    private static String getMultipartPreview(MultipartBody body, List<ViewableFileBody> fileBodies, Charset charset)
+            throws IOException {
+        fileBodies.forEach(fileBody -> fileBody.hideFileData = true);
+        try {
+            return getEntityPreview(body, charset);
+        } finally {
+            fileBodies.forEach(fileBody -> fileBody.hideFileData = false);
+        }
+    }
+
+    /**
+     * File upload that can write a placeholder instead of the content of the file, so that the
+     * request view can be built without reading the file into memory. The announced content length
+     * is always the length of the file, as the body is only rendered with the placeholder while the
+     * preview is generated, never while the request is sent.
+     */
+    private static final class ViewableFileBody extends RequestBody {
+        private static final ByteString CONTENTS_OMITTED =
+                ByteString.encodeUtf8("<actual file content, not shown here>");
+
+        private final File file;
+        private final MediaType mediaType;
+        private boolean hideFileData;
+
+        private ViewableFileBody(File file, MediaType mediaType) {
+            this.file = file;
+            this.mediaType = mediaType;
+        }
+
+        @Override
+        public MediaType contentType() {
+            return mediaType;
+        }
+
+        @Override
+        public long contentLength() {
+            return file.length();
+        }
+
+        @Override
+        public void writeTo(BufferedSink sink) throws IOException {
+            if (hideFileData) {
+                sink.write(CONTENTS_OMITTED);
+                return;
+            }
+            try (Source source = Okio.source(file)) {
+                sink.writeAll(source);
+            }
+        }
     }
 
     private static Header[] getRequestHeadersArray(HeaderManager headerManager) {
@@ -577,9 +645,12 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         }
         ResponseBody body = response.body();
         if (body != null) {
-            byte[] responseData = readResponse(result, body.byteStream(), body.contentLength());
+            // The stored response is truncated when httpsampler.max_bytes_to_store_per_request is
+            // set, so the body is counted while it is read to report what the server actually sent
+            CountingInputStream countingStream = new CountingInputStream(body.byteStream());
+            byte[] responseData = readResponse(result, countingStream, body.contentLength());
             result.setResponseData(responseData);
-            result.setBodySize((long) responseData.length);
+            result.setBodySize(countingStream.getBytesRead());
         }
     }
 
