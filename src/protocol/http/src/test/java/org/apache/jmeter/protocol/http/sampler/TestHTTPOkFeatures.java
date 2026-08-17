@@ -330,6 +330,32 @@ class TestHTTPOkFeatures extends JMeterTestCase {
     }
 
     @Test
+    void doesNotSetConnectTimeForAReusedConnection() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false));
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/pooledConnectTime")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+            URL url = new URL("https://localhost:" + server.httpsPort() + "/pooledConnectTime");
+
+            HTTPSampleResult first = sampler.sample(url, HTTPConstants.GET, false, 1);
+            HTTPSampleResult second = sampler.sample(url, HTTPConstants.GET, false, 1);
+
+            assertEquals("200", first.getResponseCode());
+            assertEquals("200", second.getResponseCode());
+            assertTrue(first.getConnectTime() > 0,
+                    "the first sample opened the connection, but its connectTime was " + first.getConnectTime());
+            assertEquals(0, second.getConnectTime(),
+                    "a sample served by an established connection must not report a connect time");
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
     void doesNotRetryClientTimeoutResponses() throws Exception {
         WireMockServer server = createServer();
         server.start();
