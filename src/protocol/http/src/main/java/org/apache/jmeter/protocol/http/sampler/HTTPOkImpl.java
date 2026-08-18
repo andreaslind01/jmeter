@@ -427,7 +427,8 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         CacheManager cacheManager = getCacheManager();
         if (cacheManager != null) {
             Header[] requestHeaders = getRequestHeadersArray(getHeaderManager());
-            cacheManager.setHeaders(url, requestHeaders, requestBuilder::header);
+            cacheManager.setHeaders(url, CacheManager.requestHeaderSink(
+                    cacheRequestHeaders(requestHeaders), requestBuilder::header));
         }
 
         String cookies = setConnectionCookie(url, getCookieManager(), requestBuilder::header);
@@ -652,6 +653,21 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             result[i++] = (Header) property.getObjectValue();
         }
         return result;
+    }
+
+    /**
+     * Adapts the headers a request will be sent with to the client neutral view used by
+     * {@link CacheManager}.
+     *
+     * @param headers headers of the request
+     * @return view of the request headers
+     */
+    private static CacheManager.RequestHeaderSource cacheRequestHeaders(Header[] headers) {
+        return action -> {
+            for (Header header : headers) {
+                action.accept(header.getName(), header.getValue());
+            }
+        };
     }
 
     private static void setConnectionHeaders(Request.Builder requestBuilder, URL url, HeaderManager headerManager) {
