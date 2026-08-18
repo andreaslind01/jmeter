@@ -54,6 +54,8 @@ import org.apache.jmeter.junit.JMeterTestCase;
 import org.apache.jmeter.protocol.http.control.AuthManager;
 import org.apache.jmeter.protocol.http.control.CacheManager;
 import org.apache.jmeter.protocol.http.control.CookieManager;
+import org.apache.jmeter.protocol.http.control.Header;
+import org.apache.jmeter.protocol.http.control.HeaderManager;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
 import org.apache.jmeter.util.JMeterUtils;
@@ -993,6 +995,48 @@ class TestHTTPOkFeatures extends JMeterTestCase {
             assertFalse(result.isSuccessful());
             assertTrue(result.getResponseCode().contains(IllegalArgumentException.class.getName()),
                     "Expected an IllegalArgumentException, but got " + result.getResponseCode());
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void sendsHostHeaderOfTheHeaderManagerWithoutItsDefaultPort() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/host")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            HeaderManager headerManager = new HeaderManager();
+            headerManager.add(new Header(HTTPConstants.HEADER_HOST, "example.com:80"));
+            sampler.setHeaderManager(headerManager);
+
+            HTTPSampleResult result = sampler.sample(new URL(server.url("/host")), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode());
+            assertEquals("example.com",
+                    server.getAllServeEvents().get(0).getRequest().getHeader(HTTPConstants.HEADER_HOST),
+                    "the default port should be stripped from the Host header, like HttpClient4 does");
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    void reportsTheCookiesOfTheHeaderManagerWhenNoCookieManagerHandlesThem() throws Exception {
+        WireMockServer server = createServer();
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/cookie")).willReturn(aResponse().withStatus(200)));
+            HTTPSamplerBase sampler = newSampler();
+            HeaderManager headerManager = new HeaderManager();
+            headerManager.add(new Header(HTTPConstants.HEADER_COOKIE, "sid=42"));
+            sampler.setHeaderManager(headerManager);
+
+            HTTPSampleResult result = sampler.sample(new URL(server.url("/cookie")), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode());
+            assertEquals("sid=42", result.getCookies());
         } finally {
             server.stop();
         }

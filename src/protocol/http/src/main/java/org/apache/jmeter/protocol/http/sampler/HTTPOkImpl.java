@@ -27,7 +27,6 @@ import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.Socket;
 import java.net.URL;
-import java.net.URLDecoder;
 import java.nio.charset.Charset;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
@@ -333,6 +332,10 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             Request.Builder requestBuilder = new Request.Builder();
             setupRequest(url, method, requestBuilder, result);
             request = requestBuilder.build();
+            if (StringUtilities.isEmpty(result.getCookies())) {
+                // the Header Manager may carry the cookies when no Cookie Manager handles them
+                result.setCookies(getOnlyCookieFromHeaders(headersOf(request.headers())));
+            }
             result.sampleStart();
 
             CacheManager cacheManager = getCacheManager();
@@ -418,7 +421,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         requestBuilder.tag(ConnectionReuseTracker.class, new ConnectionReuseTracker());
         requestBuilder.tag(SentBytesTracker.class, new SentBytesTracker());
 
-        setConnectionHeaders(requestBuilder, getHeaderManager());
+        setConnectionHeaders(requestBuilder, url, getHeaderManager());
         setDefaultUserAgent(requestBuilder);
 
         CacheManager cacheManager = getCacheManager();
@@ -427,11 +430,9 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             cacheManager.setHeaders(url, requestHeaders, requestBuilder::header);
         }
 
-        String cookies = setConnectionCookie(requestBuilder, url, getCookieManager());
+        String cookies = setConnectionCookie(url, getCookieManager(), requestBuilder::header);
         if (StringUtilities.isNotEmpty(cookies)) {
             result.setCookies(cookies);
-        } else {
-            result.setCookies(getOnlyCookieFromHeaders());
         }
 
         AuthManager authManager = getAuthManager();
@@ -518,19 +519,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             requestData = body.toString();
         } else if (hasArguments()) {
             FormBody.Builder builder = new FormBody.Builder(charset);
-            for (JMeterProperty property : getArguments().getEnabledArguments()) {
-                HTTPArgument argument = (HTTPArgument) property.getObjectValue();
-                String name = argument.getName();
-                if (argument.isSkippable(name)) {
-                    continue;
-                }
-                String value = argument.getValue();
-                if (!argument.isAlwaysEncoded()) {
-                    name = URLDecoder.decode(name, charset);
-                    value = URLDecoder.decode(value, charset);
-                }
-                builder.add(name, value);
-            }
+            forEachFormParameter(charset.name(), builder::add);
             FormBody formBody = builder.build();
             requestBody = formBody;
             requestData = getEntityPreview(formBody, charset);
@@ -665,20 +654,23 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         return result;
     }
 
-    private static void setConnectionHeaders(Request.Builder requestBuilder, HeaderManager headerManager) {
-        if (headerManager == null) {
-            return;
-        }
-        CollectionProperty headers = headerManager.getHeaders();
-        if (headers == null) {
-            return;
-        }
-        for (JMeterProperty property : headers) {
-            Header header = (Header) property.getObjectValue();
-            if (!HTTPConstants.HEADER_CONTENT_LENGTH.equalsIgnoreCase(header.getName())) {
-                requestBuilder.addHeader(header.getName(), header.getValue());
+    private static void setConnectionHeaders(Request.Builder requestBuilder, URL url, HeaderManager headerManager) {
+        setConnectionHeaders(headerManager, url, name -> true, requestBuilder::addHeader);
+    }
+
+    /**
+     * Adapts the headers of a request or a response to the representation the helpers of
+     * {@link HTTPHCAbstractImpl} work on.
+     *
+     * @param headers headers of the request or the response
+     * @return the headers of the message
+     */
+    private static HeaderIterable headersOf(Headers headers) {
+        return action -> {
+            for (int i = 0; i < headers.size(); i++) {
+                action.accept(headers.name(i), headers.value(i));
             }
-        }
+        };
     }
 
     private static void setDefaultUserAgent(Request.Builder requestBuilder) {
@@ -686,22 +678,6 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             return;
         }
         requestBuilder.header("User-Agent", DEFAULT_USER_AGENT);
-    }
-
-    private static String setConnectionCookie(Request.Builder requestBuilder, URL url, CookieManager cookieManager) {
-        if (cookieManager == null) {
-            return null;
-        }
-        String cookies = cookieManager.getCookieHeaderForURL(url);
-        if (cookies != null) {
-            requestBuilder.header(HTTPConstants.HEADER_COOKIE, cookies);
-        }
-        return cookies;
-    }
-
-    private static String getOnlyCookieFromHeaders() {
-        // Request.Builder in OkHttp does not expose getter for headers easily without building
-        return "";
     }
 
     private void readResponse(Response response, HTTPSampleResult result) throws IOException {
@@ -764,10 +740,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         StringBuilder headers = new StringBuilder();
         headers.append(formatProtocol(response.protocol())).append(' ').append(response.code()).append(' ')
                 .append(response.message()).append('\n');
-        Headers responseHeaders = response.headers();
-        for (int i = 0; i < responseHeaders.size(); i++) {
-            headers.append(responseHeaders.name(i)).append(": ").append(responseHeaders.value(i)).append('\n');
-        }
+        headers.append(formatHeaders(headersOf(response.headers()), name -> true));
         return headers.toString();
     }
 
@@ -779,15 +752,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
     }
 
     private static String getRequestHeaders(Request request) {
-        StringBuilder headers = new StringBuilder();
-        Headers requestHeaders = request.headers();
-        for (int i = 0; i < requestHeaders.size(); i++) {
-            String name = requestHeaders.name(i);
-            if (ALL_EXCEPT_COOKIE.test(name)) {
-                headers.append(name).append(": ").append(requestHeaders.value(i)).append('\n');
-            }
-        }
-        return headers.toString();
+        return formatHeaders(headersOf(request.headers()), ALL_EXCEPT_COOKIE);
     }
 
     /**
@@ -813,28 +778,15 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
     }
 
     private static long calculateRequestHeaderBytes(Request request) {
-        long sentBytes = 0;
-        String method = request.method();
         HttpUrl url = request.url();
         String pathAndQuery = url.encodedPath() + (url.encodedQuery() != null ? "?" + url.encodedQuery() : "");
-
-        sentBytes += method.getBytes(Charset.defaultCharset()).length + 1;
-        sentBytes += pathAndQuery.getBytes(Charset.defaultCharset()).length + 1;
-        sentBytes += (HTTPConstants.HTTP_1_1 + "\r\n").getBytes(Charset.defaultCharset()).length;
+        long sentBytes = HTTPMessageSizes.requestLineLength(request.method(), pathAndQuery, HTTPConstants.HTTP_1_1);
 
         Headers headers = request.headers();
         for (int i = 0; i < headers.size(); i++) {
-            String name = headers.name(i);
-            String value = headers.value(i);
-            if (name != null) {
-                sentBytes += name.getBytes(Charset.defaultCharset()).length + 2;
-            }
-            if (value != null) {
-                sentBytes += value.getBytes(Charset.defaultCharset()).length;
-            }
-            sentBytes += 2;
+            sentBytes += HTTPMessageSizes.headerLength(headers.name(i), headers.value(i));
         }
-        sentBytes += 2;
+        sentBytes += HTTPMessageSizes.EMPTY_LINE;
         return sentBytes;
     }
 
@@ -855,12 +807,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
     }
 
     private static void saveConnectionCookies(Response response, URL url, CookieManager cookieManager) {
-        if (cookieManager == null) {
-            return;
-        }
-        for (String cookieHeader : response.headers(HTTPConstants.HEADER_SET_COOKIE)) {
-            cookieManager.addCookieFromHeader(cookieHeader, url);
-        }
+        saveConnectionCookies(headersOf(response.headers()), url, cookieManager);
     }
 
     private static OkHttpClient getClient(HttpClientKey key) {
