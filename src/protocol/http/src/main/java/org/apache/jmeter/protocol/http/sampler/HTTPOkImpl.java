@@ -1008,11 +1008,15 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     private static void closeThreadLocalClients() {
         Map<HttpClientKey, OkHttpClient> clients = HTTP_CLIENTS.get();
-        for (OkHttpClient client : clients.values()) {
+        // The map is shared with the threads which download embedded resources, and those threads are
+        // pooled, so it is emptied before the clients are closed to make sure a thread which serves
+        // another JMeter thread later on builds a client of its own instead of using a closed one.
+        List<OkHttpClient> closing = new ArrayList<>(clients.values());
+        clients.clear();
+        for (OkHttpClient client : closing) {
             client.dispatcher().executorService().shutdown();
             client.connectionPool().evictAll();
         }
-        clients.clear();
     }
 
     @Override
