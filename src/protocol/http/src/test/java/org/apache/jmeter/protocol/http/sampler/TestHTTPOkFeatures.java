@@ -27,6 +27,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -43,10 +44,12 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.security.auth.Subject;
 
@@ -58,6 +61,8 @@ import org.apache.jmeter.protocol.http.control.Header;
 import org.apache.jmeter.protocol.http.control.HeaderManager;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.protocol.http.util.HTTPFileArg;
+import org.apache.jmeter.threads.JMeterContext;
+import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.util.JMeterUtils;
 import org.junit.jupiter.api.Test;
 
@@ -79,6 +84,66 @@ class TestHTTPOkFeatures extends JMeterTestCase {
     private static final String RETRY_PROPERTY = "okhttp.retry_on_connection_failure";
 
     private static final String STALE_RETRY_PROPERTY = "okhttp.stale_connection_retries";
+
+    /**
+     * The threads which download embedded resources in parallel are pooled and shared by all JMeter
+     * threads, and they adopt the context of the JMeter thread they are working for, so they must be
+     * handed the clients of that thread. Otherwise they keep the clients of the thread that happened
+     * to create them, whose connections another JMeter thread evicts at its iteration boundary or
+     * when it finishes, which fails the sample with {@code unexpected end of stream}.
+     */
+    @Test
+    void sharesClientsWithTheThreadsDownloadingEmbeddedResources() throws Exception {
+        AtomicReference<Map<?, ?>> clientsOfFirstThread = new AtomicReference<>();
+        AtomicReference<Map<?, ?>> clientsOfSecondThread = new AtomicReference<>();
+        AtomicReference<Map<?, ?>> clientsOfResourceDownloader = new AtomicReference<>();
+
+        Thread firstThread = new Thread(() -> {
+            clientsOfFirstThread.set(HTTPOkImpl.getClients());
+            JMeterContext contextOfFirstThread = JMeterContextService.getContext();
+            // see HTTPSamplerBase.ASyncSample, which replaces the context of the downloader thread
+            Thread downloader = new Thread(() -> {
+                JMeterContextService.replaceContext(contextOfFirstThread);
+                clientsOfResourceDownloader.set(HTTPOkImpl.getClients());
+            });
+            downloader.start();
+            try {
+                downloader.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        Thread secondThread = new Thread(() -> clientsOfSecondThread.set(HTTPOkImpl.getClients()));
+        firstThread.start();
+        secondThread.start();
+        firstThread.join();
+        secondThread.join();
+
+        assertSame(clientsOfFirstThread.get(), clientsOfResourceDownloader.get(),
+                "the downloads of embedded resources should use the clients of the thread they work for");
+        assertNotSame(clientsOfFirstThread.get(), clientsOfSecondThread.get(),
+                "every JMeter thread should use connections of its own, like a real user would");
+    }
+
+    /** A JMeter thread must only drop its own clients, not the ones another thread is still using. */
+    @Test
+    void closesOnlyTheClientsOfTheThreadThatFinishes() throws Exception {
+        HTTPOkImpl implementation = new HTTPOkImpl(newSampler());
+        HTTPOkImpl.HttpClientKey key = implementation.createHttpClientKey(new URL("http://example.invalid/"));
+        AtomicReference<Map<?, ?>> clientsOfOtherThread = new AtomicReference<>();
+        Thread otherThread = new Thread(() -> {
+            Map<HTTPOkImpl.HttpClientKey, OkHttpClient> clients = HTTPOkImpl.getClients();
+            clients.put(key, HTTPOkImpl.createClient(key));
+            clientsOfOtherThread.set(clients);
+        });
+        otherThread.start();
+        otherThread.join();
+
+        HTTPOkImpl.closeClientsOfCurrentThread();
+
+        assertEquals(1, clientsOfOtherThread.get().size(),
+                "the clients of the other JMeter thread should have been left alone");
+    }
 
     @Test
     void usesSamplerHttpVersionWhenSpecified() {

@@ -63,6 +63,7 @@ import org.apache.jmeter.protocol.http.util.HTTPFileArg;
 import org.apache.jmeter.services.FileServer;
 import org.apache.jmeter.testelement.property.CollectionProperty;
 import org.apache.jmeter.testelement.property.JMeterProperty;
+import org.apache.jmeter.threads.JMeterContext;
 import org.apache.jmeter.threads.JMeterContextService;
 import org.apache.jmeter.threads.JMeterVariables;
 import org.apache.jmeter.util.HttpSSLProtocolSocketFactory;
@@ -110,13 +111,20 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     private static final Logger log = LoggerFactory.getLogger(HTTPOkImpl.class);
 
-    private static final ThreadLocal<Map<HttpClientKey, OkHttpClient>> HTTP_CLIENTS =
-            new InheritableThreadLocal<>() {
-                @Override
-                protected Map<HttpClientKey, OkHttpClient> initialValue() {
-                    return new ConcurrentHashMap<>();
-                }
-            };
+    /**
+     * Clients of every JMeter thread, looked up by the {@link JMeterContext} of that thread instead
+     * of by the thread itself. The threads that download embedded resources in parallel are pooled
+     * and shared by all JMeter threads, and they adopt the context of the JMeter thread they are
+     * working for, so looking the clients up by context hands them the clients of that thread. That
+     * shares a connection between a sample and its embedded resources, which lets HTTP/2 multiplex
+     * them, and it keeps a JMeter thread from evicting the connections another one is still reading
+     * from, which used to fail those samples with {@code unexpected end of stream}.
+     *
+     * <p>The keys are weak, so that a context whose clients are never closed explicitly, like the
+     * one of a thread of the HTTP(S) Test Script Recorder, does not keep the entry alive forever.
+     */
+    private static final Map<JMeterContext, Map<HttpClientKey, OkHttpClient>> HTTP_CLIENTS =
+            Collections.synchronizedMap(new WeakHashMap<>());
 
     private static final String DISABLE_DEFAULT_UA_PROPERTY = "okhttp.default_user_agent_disabled";
 
@@ -826,9 +834,13 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         saveConnectionCookies(headersOf(response.headers()), url, cookieManager);
     }
 
+    static Map<HttpClientKey, OkHttpClient> getClients() {
+        return HTTP_CLIENTS.computeIfAbsent(JMeterContextService.getContext(),
+                context -> new ConcurrentHashMap<>());
+    }
+
     private static OkHttpClient getClient(HttpClientKey key) {
-        Map<HttpClientKey, OkHttpClient> clients = HTTP_CLIENTS.get();
-        return clients.computeIfAbsent(key, HTTPOkImpl::createClient);
+        return getClients().computeIfAbsent(key, HTTPOkImpl::createClient);
     }
 
     private static boolean isDefaultUserAgentDisabled() {
@@ -995,7 +1007,7 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     private static void resetStateIfNeeded() {
         if (resetStateOnThreadGroupIteration.get()) {
-            closeThreadLocalClients();
+            closeClientsOfCurrentThread();
             ((JsseSSLManager) SSLManager.getInstance()).resetContext();
             resetStateOnThreadGroupIteration.set(false);
         }
@@ -1003,17 +1015,21 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     @Override
     protected void threadFinished() {
-        closeThreadLocalClients();
+        closeClientsOfCurrentThread();
     }
 
-    private static void closeThreadLocalClients() {
-        Map<HttpClientKey, OkHttpClient> clients = HTTP_CLIENTS.get();
-        // The map is shared with the threads which download embedded resources, and those threads are
-        // pooled, so it is emptied before the clients are closed to make sure a thread which serves
-        // another JMeter thread later on builds a client of its own instead of using a closed one.
-        List<OkHttpClient> closing = new ArrayList<>(clients.values());
-        clients.clear();
-        for (OkHttpClient client : closing) {
+    /**
+     * Closes the clients of the current JMeter thread, which releases their connections and dispatcher
+     * threads. Only the clients of this JMeter thread are dropped. The threads which download embedded
+     * resources borrow them while they work for this thread, and they are done by the time the sample
+     * returns, so no connection is evicted while a request is still using it.
+     */
+    static void closeClientsOfCurrentThread() {
+        Map<HttpClientKey, OkHttpClient> clients = HTTP_CLIENTS.remove(JMeterContextService.getContext());
+        if (clients == null) {
+            return;
+        }
+        for (OkHttpClient client : new ArrayList<>(clients.values())) {
             client.dispatcher().executorService().shutdown();
             client.connectionPool().evictAll();
         }
