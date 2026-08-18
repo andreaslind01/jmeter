@@ -773,9 +773,9 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
 
     private static String formatProtocol(Protocol protocol) {
         if (protocol == Protocol.HTTP_2 || protocol == Protocol.H2_PRIOR_KNOWLEDGE) {
-            return HTTPConstants.HTTP_2;
+            return HTTPConstants.HTTP_VERSION_2;
         }
-        return HTTPConstants.HTTP_1_1;
+        return HTTPConstants.HTTP_VERSION_1_1;
     }
 
     private static String getRequestHeaders(Request request) {
@@ -998,7 +998,8 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
         InetAddress localAddress = getIpSourceAddress();
         boolean useDynamicProxy = isDynamicProxy(proxyHost, proxyPort);
         boolean useStaticProxy = isStaticProxy(url.getHost());
-        List<Protocol> protocols = getProtocols(testElement.getHttpVersion(), HTTP_VERSION, url.getProtocol());
+        List<Protocol> protocols = getProtocols(testElement.getHttpVersion(), DEFAULT_HTTP_VERSION,
+                url.getProtocol());
         if (!useDynamicProxy) {
             proxyScheme = PROXY_SCHEME;
             proxyHost = PROXY_HOST;

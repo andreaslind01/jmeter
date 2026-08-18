@@ -85,6 +85,16 @@ class TestHTTPOkFeatures extends JMeterTestCase {
     }
 
     @Test
+    void matchesHttpVersionIgnoringCase() {
+        assertEquals(List.of(Protocol.HTTP_2, Protocol.HTTP_1_1),
+                HTTPOkImpl.getProtocols("http/2", "HTTP/1.1", "https"));
+        assertEquals(List.of(Protocol.HTTP_2, Protocol.HTTP_1_1),
+                HTTPOkImpl.getProtocols("", "http/2", "https"));
+        assertEquals(List.of(Protocol.HTTP_2, Protocol.HTTP_1_1),
+                HTTPOkImpl.getProtocols("http/2 strict", "HTTP/1.1", "https"));
+    }
+
+    @Test
     void defaultsToHttp11ForUnsupportedHttpVersion() {
         assertEquals(List.of(Protocol.HTTP_1_1), HTTPOkImpl.getProtocols("HTTP/3", "HTTP/2", "https"));
     }
