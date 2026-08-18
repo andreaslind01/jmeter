@@ -278,6 +278,11 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
 
     @Override
     protected void testEnded() {
+        releaseSharedHttp2Resources();
+    }
+
+    /** Closes the clients shared by all threads and shuts down the thread pool they use. */
+    static void releaseSharedHttp2Resources() {
         closeHttp2Clients(SHARED_HTTP_2_CLIENTS);
         ExecutorService executor = HTTP_2_EXECUTOR.getAndSet(null);
         if (executor != null) {
@@ -1262,34 +1267,35 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
         }
     }
 
-    private byte[] readResponse(HttpResponse<InputStream> response, SampleResult res) throws IOException {
-        InputStream in = response.body();
-        if (in == null) {
-            return NULL_BA;
-        }
+    byte[] readResponse(HttpResponse<InputStream> response, SampleResult res) throws IOException {
+        try (InputStream in = response.body()) {
+            if (in == null) {
+                return NULL_BA;
+            }
 
-        boolean gzipped = response.headers().firstValue(HTTPConstants.HEADER_CONTENT_ENCODING)
-                .map(HTTPConstants.ENCODING_GZIP::equalsIgnoreCase)
-                .orElse(false);
+            boolean gzipped = response.headers().firstValue(HTTPConstants.HEADER_CONTENT_ENCODING)
+                    .map(HTTPConstants.ENCODING_GZIP::equalsIgnoreCase)
+                    .orElse(false);
 
-        long contentLength = response.headers().firstValueAsLong(HTTPConstants.HEADER_CONTENT_LENGTH).orElse(-1L);
+            long contentLength = response.headers().firstValueAsLong(HTTPConstants.HEADER_CONTENT_LENGTH).orElse(-1L);
 
-        if (contentLength == 0 && OBEY_CONTENT_LENGTH) {
-            log.info("Content-Length: 0, not reading http-body");
-            res.setResponseHeaders(getResponseHeaders(response));
-            res.latencyEnd();
-            return NULL_BA;
-        }
+            if (contentLength == 0 && OBEY_CONTENT_LENGTH) {
+                log.info("Content-Length: 0, not reading http-body");
+                res.setResponseHeaders(getResponseHeaders(response));
+                res.latencyEnd();
+                return NULL_BA;
+            }
 
-        CountingInputStream instream = new CountingInputStream(in);
-        InputStream stream = gzipped ? new GZIPInputStream(instream) : instream;
+            CountingInputStream instream = new CountingInputStream(in);
+            InputStream stream = gzipped ? new GZIPInputStream(instream) : instream;
 
-        try {
-            byte[] responseData = readResponse(res, stream, contentLength);
-            res.setBodySize(instream.getBytesRead());
-            return responseData;
-        } finally {
-            instream.close();
+            try {
+                byte[] responseData = readResponse(res, stream, contentLength);
+                res.setBodySize(instream.getBytesRead());
+                return responseData;
+            } finally {
+                instream.close();
+            }
         }
     }
 
