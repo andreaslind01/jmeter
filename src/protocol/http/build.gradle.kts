@@ -70,6 +70,12 @@ dependencies {
     implementation("org.apache.httpcomponents:httpcore")
     implementation("org.brotli:dec")
     implementation("com.miglayout:miglayout-swing")
+    implementation("com.squareup.okhttp3:okhttp") {
+        because("HTTPOkImpl uses OkHttp for HTTP/1.1 and HTTP/2")
+    }
+    implementation("com.squareup.okio:okio") {
+        because("HTTPOkImpl uses Okio sources for response decompression")
+    }
     implementation("com.fasterxml.jackson.core:jackson-core")
     implementation("com.fasterxml.jackson.core:jackson-databind")
     testImplementation(testFixtures(projects.src.core))

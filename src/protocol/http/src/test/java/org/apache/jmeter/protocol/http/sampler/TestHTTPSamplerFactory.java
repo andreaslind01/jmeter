@@ -39,6 +39,16 @@ public class TestHTTPSamplerFactory {
     }
 
     @Test
+    void okHttpIsSelectable() {
+        assertTrue(Arrays.asList(HTTPSamplerFactory.getImplementations()).contains("OkHttp"));
+
+        HTTPSamplerBase sampler = HTTPSamplerFactory.newInstance("OkHttp");
+
+        assertEquals("OkHttp", sampler.getImplementation());
+        assertInstanceOf(HTTPOkImpl.class, HTTPSamplerFactory.getImplementation(sampler.getImplementation(), sampler));
+    }
+
+    @Test
     void unknownImplementationIsRejected() {
         assertThrows(IllegalArgumentException.class, () -> HTTPSamplerFactory.newInstance("HttpClient6"));
     }
@@ -49,6 +59,8 @@ public class TestHTTPSamplerFactory {
                 Arrays.asList(HTTPSamplerFactory.getHttpVersions("HttpClient4")));
         assertEquals(Arrays.asList("", "HTTP/1.1", "HTTP/2"),
                 Arrays.asList(HTTPSamplerFactory.getHttpVersions("Java")));
+        assertEquals(Arrays.asList("", "HTTP/1.1", "HTTP/2"),
+                Arrays.asList(HTTPSamplerFactory.getHttpVersions("OkHttp")));
         assertEquals(Arrays.asList("", "HTTP/1.1", "HTTP/2", "HTTP/2 Strict"),
                 Arrays.asList(HTTPSamplerFactory.getHttpVersions("HttpClient5")));
     }

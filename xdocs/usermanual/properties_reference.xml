@@ -442,7 +442,7 @@ JMETER-SERVER</source>
     Defaults to: <code>0</code>
 </property>
 <property name="httpclient.version">
-    Set the default HTTP version for HttpClient5 and Java samplers with an empty HTTP Version value.<br/>
+    Set the default HTTP version for HttpClient5, OkHttp and Java samplers with an empty HTTP Version value.<br/>
     Valid values are <code>HTTP/1.1</code>, <code>HTTP/2</code> and, for HttpClient5 only,
     <code>HTTP/2 Strict</code>. The legacy values <code>1.0</code> and <code>1.1</code> are still
     accepted and both select <code>HTTP/1.1</code> for these samplers.<br/>
@@ -510,6 +510,37 @@ JMETER-SERVER</source>
     If true, the default HC5 User-Agent (Apache-HttpClient/X.Y.Z (Java/A.B.C)) will not be added.
     A User-Agent header defined in the test plan is still sent.<br/>
     Defaults to: <code>false</code>
+</property>
+<property name="okhttp.retry_on_connection_failure">
+    Silently retry a request of the OkHttp sampler implementation on a new connection when the
+    connection failed in a recoverable way, and repeat requests answered with <code>408</code>
+    (Request Timeout). Disabled by default, so that the sample result reports the failure and the
+    timing of the server instead of hiding them.<br/>
+    Defaults to: <code>false</code>
+</property>
+<property name="okhttp.stale_connection_retries">
+    Number of times a request of the OkHttp sampler implementation is sent again on another
+    connection when it failed on a connection that had already carried a response, that is on a
+    reused connection. OkHttp only checks a pooled connection for a close of the peer when the
+    request is not a <code>GET</code>, so a keep alive connection the server (or a load balancer in
+    between) closed while the thread was busy elsewhere would fail the sample with
+    <code>unexpected end of stream</code>. Failures on a connection that never carried a response,
+    timeouts and protocol errors are never repeated, and <code>0</code> disables the recovery. Every
+    attempt discards the connection it failed on, so the default allows draining a pool that is full
+    of connections the peer closed.<br/>
+    Defaults to the value of <code>okhttp.max_idle_connections</code>: <code>6</code>
+</property>
+<property name="okhttp.max_idle_connections">
+    Maximum number of idle connections the OkHttp sampler implementation keeps per thread and target.
+    The parallel downloads of the embedded resources of a page share the pool, so it should not be
+    smaller than the number of parallel downloads.<br/>
+    Defaults to: <code>6</code>
+</property>
+<property name="okhttp.idle_connection_timeout">
+    Milliseconds an unused connection of the OkHttp sampler implementation is kept in the pool.
+    Aligning it with the keep alive timeout of the server avoids handing out connections the peer has
+    closed in the meantime.<br/>
+    Defaults to: <code>300000</code>
 </property>
 <property name="http.java.h2.share_connections_between_threads">
     Multiplex the HTTP/2 message exchanges of all JMeter threads of the Java sampler implementation
@@ -914,6 +945,8 @@ JMETER-SERVER</source>
         <dd>Use Apache HTTPClient version 4</dd>
         <dt><code>HttpClient5</code></dt>
         <dd>Use Apache HTTPClient version 5</dd>
+        <dt><code>OkHttp</code></dt>
+        <dd>Use OkHttp library</dd>
     </dl>
     Defaults to: <code>HttpClient4</code>
 </property>
