@@ -376,6 +376,9 @@ public class HTTPOkImpl extends HTTPHCAbstractImpl {
             saveConnectionCookies(response, result.getURL(), getCookieManager());
             return resultProcessing(areFollowingRedirect, frameDepth, result);
         } catch (Exception e) {
+            if (result.getStartTime() == 0) {
+                result.sampleStart();
+            }
             if (result.getEndTime() == 0) {
                 result.sampleEnd();
             }
