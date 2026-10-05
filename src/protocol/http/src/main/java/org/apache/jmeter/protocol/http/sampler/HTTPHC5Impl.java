@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.MalformedURLException;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -1239,6 +1240,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 .disableContentCompression()
                 .setH2Config(HTTP_2_CONFIG)
                 .setRoutePlanner(createRoutePlanner(key));
+        AsyncResponseTimeout.install(builder);
         if (HTTP_2_MULTIPLEXING) {
             // A connection bound to a user token cannot be shared, and HTTP/2 has no connection scoped state anyway
             builder.disableConnectionState();
@@ -1280,6 +1282,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     private ClassicHttpResponse executeHttp2(CloseableHttpAsyncClient client,
             org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context)
             throws IOException {
+        AsyncResponseTimeout responseTimeout = AsyncResponseTimeout.attach(request.getConfig(), context);
         RequestBody requestBody = createRequestBody(request);
         try {
             Future<ClassicHttpResponse> responseFuture = client.execute(requestBody.producer,
@@ -1292,13 +1295,19 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 responseFuture.cancel(true);
             }
             try {
-                return responseFuture.get();
+                return responseTimeout.await(responseFuture);
             } catch (InterruptedException e) {
                 responseFuture.cancel(true);
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while executing HTTP/2 request", e);
             } catch (ExecutionException e) {
-                throw new IOException("Could not execute HTTP/2 request", e.getCause());
+                Throwable cause = e.getCause();
+                if (cause instanceof SocketTimeoutException timeout) {
+                    // A timeout HttpClient detected itself, like the response timeout it applies when
+                    // HTTP/1.1 was negotiated, so the sample reports it like the HTTP/1.1 transport does
+                    throw timeout;
+                }
+                throw new IOException("Could not execute HTTP/2 request", cause);
             } finally {
                 currentResponseFuture = null;
             }

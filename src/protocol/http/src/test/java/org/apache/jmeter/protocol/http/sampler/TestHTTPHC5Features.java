@@ -503,6 +503,106 @@ class TestHTTPHC5Features {
         }
     }
 
+    /**
+     * HttpClient applies the response timeout only to HTTP/1.1 connections, as it can set it as socket
+     * timeout of the connection only, which all streams of an HTTP/2 connection share. A server that
+     * accepts the stream and never answers must still fail the sample once the timeout expires, like it
+     * does over HTTP/1.1, instead of blocking the thread until the test is stopped.
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void failsNegotiatedHttp2SampleWhenServerDoesNotRespondWithinResponseTimeout() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false));
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/silent")).willReturn(aResponse().withStatus(200).withFixedDelay(20_000)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+            sampler.setResponseTimeout("1000");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("https://localhost:" + server.httpsPort() + "/silent"), HTTPConstants.GET, false, 1);
+
+            assertResponseTimedOut(result);
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void failsStrictHttp2SampleWhenServerDoesNotRespondWithinResponseTimeout() throws Exception {
+        try (StallingHttp2Server server = new StallingHttp2Server(false)) {
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2 Strict");
+            sampler.setResponseTimeout("1000");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("http://localhost:" + server.getPort() + "/silent"), HTTPConstants.GET, false, 1);
+
+            assertResponseTimedOut(result);
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void failsHttp2SampleWhenResponseBodyStallsLongerThanResponseTimeout() throws Exception {
+        try (StallingHttp2Server server = new StallingHttp2Server(true)) {
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2 Strict");
+            sampler.setResponseTimeout("1000");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("http://localhost:" + server.getPort() + "/stalled"), HTTPConstants.GET, false, 1);
+
+            assertResponseTimedOut(result);
+        }
+    }
+
+    /**
+     * The response timeout limits each wait for the server, not the whole exchange, so a response that
+     * keeps arriving in chunks must not fail even though it takes longer than the timeout in total.
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void doesNotFailHttp2SampleWhileResponseDataKeepsArrivingWithinResponseTimeout() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false));
+        server.start();
+        try {
+            // a chunk every 250 ms, so the exchange takes about 2.5 s, well beyond the timeout
+            server.stubFor(get(urlEqualTo("/trickle"))
+                    .willReturn(aResponse().withStatus(200).withBody(new byte[10_000]).withChunkedDribbleDelay(10, 2_500)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+            sampler.setResponseTimeout("1500");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("https://localhost:" + server.httpsPort() + "/trickle"), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode(), result::getResponseMessage);
+            assertEquals("HTTP/2", result.getResponseHeaders().substring(0, "HTTP/2".length()));
+            assertEquals(10_000, result.getResponseData().length);
+            assertTrue(result.getTime() > 1500,
+                    () -> "the exchange should have taken longer than the response timeout, but took "
+                            + result.getTime() + " ms");
+        } finally {
+            server.stop();
+        }
+    }
+
+    private static void assertResponseTimedOut(HTTPSampleResult result) {
+        assertFalse(result.isSuccessful(), "the sample should have failed with a response timeout");
+        assertEquals("Non HTTP response code: java.net.SocketTimeoutException", result.getResponseCode(),
+                result::getResponseMessage);
+        assertTrue(result.getTime() >= 900 && result.getTime() < 10_000,
+                () -> "the sample should have failed after the response timeout of 1000 ms, but took "
+                        + result.getTime() + " ms");
+    }
+
     @Test
     void fallsBackToHttp11WhenServerDoesNotSupportHttp2() throws Exception {
         WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
