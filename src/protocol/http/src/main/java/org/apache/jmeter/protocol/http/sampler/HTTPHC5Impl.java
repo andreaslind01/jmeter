@@ -50,6 +50,7 @@ import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
 
 import javax.net.ssl.SSLContext;
 import javax.security.auth.Subject;
@@ -104,6 +105,7 @@ import org.apache.hc.client5.http.ssl.HostnameVerificationPolicy;
 import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
 import org.apache.hc.client5.http.ssl.TlsSocketStrategy;
 import org.apache.hc.client5.http.utils.URIUtils;
+import org.apache.hc.core5.concurrent.DefaultThreadFactory;
 import org.apache.hc.core5.concurrent.FutureCallback;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
@@ -1196,9 +1198,10 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     }
 
     private static CloseableHttpAsyncClient getHttp2Client(HttpClientKey key) {
+        JMeterContext jmeterContext = JMeterContextService.getContext();
         Map<HttpClientKey, CloseableHttpAsyncClient> clients =
-                HTTP_2_CLIENTS.computeIfAbsent(JMeterContextService.getContext(), context -> new ConcurrentHashMap<>());
-        return clients.computeIfAbsent(key, HTTPHC5Impl::createHttp2Client);
+                HTTP_2_CLIENTS.computeIfAbsent(jmeterContext, context -> new ConcurrentHashMap<>());
+        return clients.computeIfAbsent(key, k -> createHttp2Client(k, jmeterContext));
     }
 
     private static boolean isDefaultUserAgentDisabled() {
@@ -1231,7 +1234,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 .build();
     }
 
-    private static CloseableHttpAsyncClient createHttp2Client(HttpClientKey key) {
+    private static CloseableHttpAsyncClient createHttp2Client(HttpClientKey key, JMeterContext jmeterContext) {
         HttpAsyncClientBuilder builder = HttpAsyncClients.custom()
                 .disableAutomaticRetries()
                 // HttpClient 5.6 added transparent content compression to the async transport. JMeter decodes
@@ -1239,7 +1242,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 // does not depend on the optional codec libraries HttpClient detects on the classpath.
                 .disableContentCompression()
                 .setH2Config(HTTP_2_CONFIG)
-                .setRoutePlanner(createRoutePlanner(key));
+                .setRoutePlanner(createRoutePlanner(key))
+                .setThreadFactory(threadsSharingContext(jmeterContext));
         AsyncResponseTimeout.install(builder);
         if (HTTP_2_MULTIPLEXING) {
             // A connection bound to a user token cannot be shared, and HTTP/2 has no connection scoped state anyway
@@ -1277,6 +1281,21 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         CloseableHttpAsyncClient asyncClient = builder.build();
         asyncClient.start();
         return asyncClient;
+    }
+
+    /**
+     * Creates the threads of an HTTP/2 client with the {@link JMeterContext} of the JMeter thread the
+     * client belongs to, like the threads which download embedded resources in parallel. They run
+     * the TLS handshakes, in which the key manager of the JMeter key store picks the client
+     * certificate, by the alias variable of the Keystore Configuration among others, so they have to
+     * see the variables of that thread rather than those of a context of their own.
+     */
+    private static ThreadFactory threadsSharingContext(JMeterContext jmeterContext) {
+        ThreadFactory threadFactory = new DefaultThreadFactory("httpclient-dispatch", true);
+        return runnable -> threadFactory.newThread(() -> {
+            JMeterContextService.replaceContext(jmeterContext);
+            runnable.run();
+        });
     }
 
     private ClassicHttpResponse executeHttp2(CloseableHttpAsyncClient client,
@@ -1319,9 +1338,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     }
 
     /**
-     * Number of response body bytes worth keeping, {@code 0} meaning all of them. This has to be
-     * determined on the sampler thread, as the recording flag lives in a thread local the HTTP/2
-     * I/O reactor threads do not see. Truncation is also given up when an MD5 digest is requested,
+     * Number of response body bytes worth keeping, {@code 0} meaning all of them, which is
+     * determined on the sampler thread when the request is executed and handed to the response
+     * consumer. Truncation is given up while recording, and when an MD5 digest is requested,
      * because that is computed over the whole body.
      */
     private long getMaxBytesToStore() {
