@@ -530,6 +530,11 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             resetStateIfNeeded();
             request = createRequest(url.toURI(), method);
             setupRequest(url, request, result, areFollowingRedirect);
+            // The client is set up before the sample starts, like HTTPHC4Impl does, so that the first
+            // sample of a thread, or of each iteration that starts as a new user, does not include
+            // building the client, its SSL context and, for HTTP/2, starting its I/O reactor
+            HttpClientKey clientKey = createHttpClientKey(url);
+            RequestExecutor executor = getRequestExecutor(clientKey);
             result.sampleStart();
 
             CacheManager cacheManager = getCacheManager();
@@ -541,10 +546,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
             interruptRequested = false;
             currentRequest = request;
-            HttpClientKey clientKey = createHttpClientKey(url);
             context = createHttpClientContext(url, clientKey, request);
             context.setAttribute(CONTEXT_ATTRIBUTE_SAMPLER_RESULT, result);
-            response = executeRequest(url, clientKey, request, context);
+            response = executeRequest(url, clientKey, executor, request, context);
             readResponse(response, result, context);
             Long responseLatency = (Long) context.getAttribute(CONTEXT_ATTRIBUTE_RESPONSE_LATENCY);
             if (responseLatency != null) {
@@ -597,7 +601,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      * the proxy is covered by a Kerberos authorization, so that the auth scheme can use its
      * credentials.
      */
-    private ClassicHttpResponse executeRequest(URL url, HttpClientKey clientKey,
+    private ClassicHttpResponse executeRequest(URL url, HttpClientKey clientKey, RequestExecutor executor,
             org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context)
             throws IOException {
         Subject subject = getSubjectForUrl(url);
@@ -605,11 +609,11 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             subject = getSubjectForProxy(clientKey);
         }
         if (subject == null) {
-            return doExecuteRequest(clientKey, request, context);
+            return executor.execute(request, context);
         }
         try {
             return Subject.doAs(subject, (PrivilegedExceptionAction<ClassicHttpResponse>) () ->
-                    doExecuteRequest(clientKey, request, context));
+                    executor.execute(request, context));
         } catch (PrivilegedActionException e) {
             Exception cause = e.getException();
             if (cause instanceof IOException ioException) {
@@ -619,12 +623,24 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         }
     }
 
-    private ClassicHttpResponse doExecuteRequest(HttpClientKey clientKey,
-            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context)
-            throws IOException {
-        return clientKey.httpVersionPolicy != HttpVersionPolicy.FORCE_HTTP_1
-                ? executeHttp2(getHttp2Client(clientKey), request, context)
-                : getClient(clientKey).executeOpen(null, request, context);
+    /** Executes a request with a client that is already set up. */
+    @FunctionalInterface
+    private interface RequestExecutor {
+        ClassicHttpResponse execute(org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
+                HttpClientContext context) throws IOException;
+    }
+
+    /**
+     * Looks up the client for requests with the given key, the HTTP/2 one unless HTTP/1.1 is
+     * forced, and builds it if the thread has none yet.
+     */
+    private RequestExecutor getRequestExecutor(HttpClientKey clientKey) {
+        if (clientKey.httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_1) {
+            CloseableHttpClient client = getClient(clientKey);
+            return (request, context) -> client.executeOpen(null, request, context);
+        }
+        CloseableHttpAsyncClient client = getHttp2Client(clientKey);
+        return (request, context) -> executeHttp2(client, request, context);
     }
 
     private void setupRequest(URL url, org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
