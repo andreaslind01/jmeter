@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -46,6 +47,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPOutputStream;
 
 import org.apache.hc.client5.http.HttpRoute;
 import org.apache.hc.client5.http.auth.AuthSchemeFactory;
@@ -77,8 +79,11 @@ import org.apache.jmeter.threads.JMeterContext;
 import org.apache.jmeter.threads.JMeterContextService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.http.HttpHeader;
@@ -446,6 +451,62 @@ class TestHTTPHC5Features {
         } finally {
             server.stop();
         }
+    }
+
+    /**
+     * Only the MD5 digest of the body is stored, which must not make the sample report the size of the
+     * digest instead of the bytes that were received, which is what Received KB/sec is computed from. A
+     * compressed body is reported with its compressed size. HttpClient4 is the reference.
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "HttpClient4, HTTP/1.1, identity",
+            "HttpClient4, HTTP/1.1, gzip",
+            "HttpClient5, HTTP/1.1, identity",
+            "HttpClient5, HTTP/1.1, gzip",
+            "HttpClient5, HTTP/2, identity",
+            "HttpClient5, HTTP/2, gzip"})
+    void reportsTheReceivedBodySizeWhenOnlyTheMd5IsStored(String implementation, String httpVersion,
+            String contentEncoding) throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false)
+                .gzipDisabled(true));
+        try {
+            server.start();
+            byte[] body = new byte[200_000];
+            for (int i = 0; i < body.length; i++) {
+                body[i] = (byte) (i % 251);
+            }
+            byte[] sent = "gzip".equals(contentEncoding) ? gzip(body) : body;
+            ResponseDefinitionBuilder response = aResponse().withStatus(200)
+                    .withHeader(HttpHeaders.CONTENT_LENGTH, Integer.toString(sent.length))
+                    .withBody(sent);
+            if ("gzip".equals(contentEncoding)) {
+                response.withHeader(HttpHeaders.CONTENT_ENCODING, contentEncoding);
+            }
+            server.stubFor(get(urlEqualTo("/md5")).willReturn(response));
+            HTTPSamplerBase sampler = HTTPSamplerFactory.newInstance(implementation);
+            sampler.setHttpVersion(httpVersion);
+            sampler.setMD5(true);
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("https://localhost:" + server.httpsPort() + "/md5"), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode(), result::getResponseMessage);
+            assertEquals(32, result.getResponseData().length, "only the MD5 digest should be stored");
+            assertEquals(sent.length, result.getBodySizeAsLong(), "the received body size should be reported");
+        } finally {
+            server.stop();
+        }
+    }
+
+    private static byte[] gzip(byte[] data) throws IOException {
+        ByteArrayOutputStream compressed = new ByteArrayOutputStream();
+        try (GZIPOutputStream out = new GZIPOutputStream(compressed)) {
+            out.write(data);
+        }
+        return compressed.toByteArray();
     }
 
     @Test

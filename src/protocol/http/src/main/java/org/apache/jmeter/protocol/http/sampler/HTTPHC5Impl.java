@@ -359,11 +359,27 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             requestConfig = RequestConfig.DEFAULT;
         }
         ClassicHttpResponse response = chain.proceed(request, scope);
+        countResponseBody(response, context);
         if (!requestConfig.isContentCompressionEnabled()) {
             return response;
         }
-        return decompressResponse(response, context);
+        return decompressResponse(response);
     };
+
+    /**
+     * Counts the response body as it is read off the connection, before it is decoded, so that the
+     * sample reports the size that was received, as HTTPHC4Impl does. The size of the body
+     * {@link HTTPSamplerBase#readResponse} keeps would be the size of the decoded body, of the
+     * truncated one, or of the MD5 digest of the body.
+     */
+    private static void countResponseBody(ClassicHttpResponse response, HttpContext context) {
+        HttpEntity entity = response.getEntity();
+        if (entity != null) {
+            CountingEntity countingEntity = new CountingEntity(entity);
+            response.setEntity(countingEntity);
+            context.setAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_COUNTER, countingEntity);
+        }
+    }
 
     /**
      * Decodes the response body while keeping the {@code Content-Encoding}, {@code Content-Length} and
@@ -372,7 +388,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      * and decodes the response itself for both the HTTP/1.1 and the HTTP/2 transport.
      */
     @SuppressWarnings("deprecation") // DecompressingEntity is superseded by the @Internal ContentCodecRegistry
-    private static ClassicHttpResponse decompressResponse(ClassicHttpResponse response, HttpContext context) {
+    private static ClassicHttpResponse decompressResponse(ClassicHttpResponse response) {
         HttpEntity entity = response.getEntity();
         if (entity == null || entity.getContentLength() == 0) {
             return response;
@@ -395,16 +411,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         }
         HeaderElement[] codecs = BasicHeaderValueParser.INSTANCE.parseElements(contentEncoding,
                 new ParserCursor(0, contentEncoding.length()));
-        CountingEntity countingEntity = new CountingEntity(entity);
-        boolean decompressing = false;
         for (HeaderElement codec : codecs) {
             InputStreamFactory decoderFactory = CONTENT_DECODERS.lookup(codec.getName().toLowerCase(Locale.ROOT));
             if (decoderFactory != null) {
-                if (!decompressing) {
-                    response.setEntity(countingEntity);
-                    context.setAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_COUNTER, countingEntity);
-                    decompressing = true;
-                }
                 response.setEntity(new DecompressingEntity(response.getEntity(), decoderFactory));
                 response.removeHeaders(HttpHeaders.CONTENT_LENGTH);
                 response.removeHeaders(HttpHeaders.CONTENT_ENCODING);
@@ -1052,10 +1061,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         if (entity != null) {
             byte[] body = readResponse(result, entity.getContent(), entity.getContentLength());
             result.setResponseData(body);
-            // The HTTP/2 transport counts the body while it streams it, so a truncated response
-            // still reports the number of bytes the server actually sent. For HTTP/1.1 a compressed
-            // body is counted before it is decoded, so the reported size is the one that crossed the
-            // wire, like HTTPHC4Impl and HTTPJavaImpl report it
+            // Both transports count the body as they receive it, so the size that crossed the wire is
+            // reported, before the body is decoded, truncated or replaced by its MD5 digest, like
+            // HTTPHC4Impl reports it
             Long bodySize = (Long) context.getAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_SIZE);
             CountingEntity bodyCounter =
                     (CountingEntity) context.getAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_COUNTER);
@@ -1530,7 +1538,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             }
             // The body may have been truncated, so report what the server actually sent
             context.setAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_SIZE, totalBodyBytes);
-            return decompressResponse(response, context);
+            return decompressResponse(response);
         }
 
         @Override
