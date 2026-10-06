@@ -414,6 +414,13 @@ rather than <code>www.example.co.uk</code>, it will not get the correct cookies.
 Likewise, Headers are sent for the initial request, and won't be sent for the redirect.
 This is generally only a problem for manually created test plans,
 as a test plan created using a recorder would continue from the redirected URL.
+<br/>
+The <code>HttpClient5</code> implementation sends each redirect with the cookies the
+<complink name="HTTP Cookie Manager"/> holds for the URL of the redirect, and keeps the cookies the redirects set,
+like the samples of "<code>Follow Redirects</code>" are handled. The credentials of the
+<complink name="HTTP Authorization Manager"/> are likewise the ones for the URL of the redirect, and a
+<code>Cookie</code> or <code>Authorization</code> header of the <complink name="HTTP Header Manager"/> is only sent
+to the host of the initial URL.
 </note>
 <p>
 <b>Parameter Handling:</b><br></br>

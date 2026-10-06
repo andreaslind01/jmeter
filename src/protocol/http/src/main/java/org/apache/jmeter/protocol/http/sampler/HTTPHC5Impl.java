@@ -620,7 +620,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         HttpVersionPolicy httpVersionPolicy = getHttpVersionPolicy(testElement.getHttpVersion(), DEFAULT_HTTP_VERSION,
                 url.getProtocol());
         RequestConfig.Builder config = RequestConfig.custom()
-                .setRedirectsEnabled(getAutoRedirects() && !areFollowingRedirect);
+                .setRedirectsEnabled(getAutoRedirects() && !areFollowingRedirect)
+                .setMaxRedirects(HTTPSamplerBase.MAX_REDIRECTS);
         int responseTimeout = getResponseTimeout();
         if (responseTimeout > 0) {
             config.setResponseTimeout(Timeout.ofMilliseconds(responseTimeout));
@@ -840,6 +841,10 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             configureKerberos(url, key, request, context, credentialsProvider, kerberosTarget, kerberosProxy);
         } else {
             context.setCredentialsProvider(credentialsProvider);
+        }
+        if (request.getConfig() == null || request.getConfig().isRedirectsEnabled()) {
+            AutoRedirectStrategy.attach(context, url, getCookieManager(), getAuthManager(), getHeaderManager(),
+                    credentialsProvider);
         }
         return context;
     }
@@ -1230,6 +1235,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         builder.setConnectionManager(new ConnectTimeMeasuringConnectionManager(connectionManagerBuilder.build()));
         builder.setRoutePlanner(createRoutePlanner(key));
         return builder.disableContentCompression()
+                // Cookies are left to the Cookie Manager, see AutoRedirectStrategy for those of redirects
+                .disableCookieManagement()
+                .setRedirectStrategy(AutoRedirectStrategy.INSTANCE)
                 .addExecInterceptorFirst("response-content-encoding", RESPONSE_CONTENT_ENCODING)
                 .build();
     }
@@ -1243,6 +1251,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 .disableContentCompression()
                 .setH2Config(HTTP_2_CONFIG)
                 .setRoutePlanner(createRoutePlanner(key))
+                // Cookies are left to the Cookie Manager, see AutoRedirectStrategy for those of redirects
+                .disableCookieManagement()
+                .setRedirectStrategy(AutoRedirectStrategy.INSTANCE)
                 .setThreadFactory(threadsSharingContext(jmeterContext));
         AsyncResponseTimeout.install(builder);
         if (HTTP_2_MULTIPLEXING) {
