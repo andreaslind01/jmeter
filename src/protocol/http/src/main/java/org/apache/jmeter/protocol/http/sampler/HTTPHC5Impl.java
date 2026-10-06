@@ -141,6 +141,7 @@ import org.apache.hc.core5.io.CloseMode;
 import org.apache.hc.core5.net.URIAuthority;
 import org.apache.hc.core5.pool.PoolConcurrencyPolicy;
 import org.apache.hc.core5.reactor.ConnectionInitiator;
+import org.apache.hc.core5.reactor.IOReactorConfig;
 import org.apache.hc.core5.util.TimeValue;
 import org.apache.hc.core5.util.Timeout;
 import org.apache.hc.core5.util.VersionInfo;
@@ -158,6 +159,7 @@ import org.apache.jmeter.services.FileServer;
 import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.threads.JMeterContext;
 import org.apache.jmeter.threads.JMeterContextService;
+import org.apache.jmeter.threads.JMeterThread;
 import org.apache.jmeter.threads.JMeterVariables;
 import org.apache.jmeter.util.JMeterUtils;
 import org.apache.jmeter.util.JsseSSLManager;
@@ -1214,7 +1216,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         JMeterContext jmeterContext = JMeterContextService.getContext();
         Map<HttpClientKey, CloseableHttpAsyncClient> clients =
                 HTTP_2_CLIENTS.computeIfAbsent(jmeterContext, context -> new ConcurrentHashMap<>());
-        return clients.computeIfAbsent(key, k -> createHttp2Client(k, jmeterContext));
+        return clients.computeIfAbsent(key.forAnyOrigin(), k -> createHttp2Client(k, jmeterContext));
     }
 
     private static boolean isDefaultUserAgentDisabled() {
@@ -1262,6 +1264,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 // Cookies are left to the Cookie Manager, see AutoRedirectStrategy for those of redirects
                 .disableCookieManagement()
                 .setRedirectStrategy(AutoRedirectStrategy.INSTANCE)
+                // A JMeter thread only has a few requests in flight, which a single I/O thread serves
+                // easily, whereas HttpClient would start one per processor for every client
+                .setIOReactorConfig(IOReactorConfig.custom().setIoThreadCount(1).build())
                 .setThreadFactory(threadsSharingContext(jmeterContext));
         AsyncResponseTimeout.install(builder);
         if (HTTP_2_MULTIPLEXING) {
@@ -1307,10 +1312,13 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      * client belongs to, like the threads which download embedded resources in parallel. They run
      * the TLS handshakes, in which the key manager of the JMeter key store picks the client
      * certificate, by the alias variable of the Keystore Configuration among others, so they have to
-     * see the variables of that thread rather than those of a context of their own.
+     * see the variables of that thread rather than those of a context of their own. They are named
+     * after that thread, so a thread dump tells which JMeter thread they work for.
      */
     private static ThreadFactory threadsSharingContext(JMeterContext jmeterContext) {
-        ThreadFactory threadFactory = new DefaultThreadFactory("httpclient-dispatch", true);
+        JMeterThread jmeterThread = jmeterContext.getThread();
+        String owner = jmeterThread != null ? jmeterThread.getThreadName() : Thread.currentThread().getName();
+        ThreadFactory threadFactory = new DefaultThreadFactory(owner + " httpclient5", true);
         return runnable -> threadFactory.newThread(() -> {
             JMeterContextService.replaceContext(jmeterContext);
             runnable.run();
@@ -1887,6 +1895,16 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             this.dnsCacheManager = dnsCacheManager;
             this.localAddress = localAddress;
             this.httpVersionPolicy = httpVersionPolicy;
+        }
+
+        /**
+         * Key of the HTTP/2 client, which serves every origin, as its pool keeps the connections per
+         * route and nothing else about it depends on the origin. So a JMeter thread usually has a
+         * single HTTP/2 client, and with it a single I/O reactor, whatever the hosts it samples.
+         */
+        HttpClientKey forAnyOrigin() {
+            return new HttpClientKey(null, null, hasProxy, proxyScheme, proxyHost, proxyPort, proxyUser, proxyPass,
+                    connectTimeout, dnsCacheManager, localAddress, httpVersionPolicy);
         }
 
         @Override

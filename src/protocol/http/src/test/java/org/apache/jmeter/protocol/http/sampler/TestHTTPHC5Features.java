@@ -40,6 +40,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -192,6 +193,58 @@ class TestHTTPHC5Features {
         } finally {
             server.stop();
         }
+    }
+
+    /**
+     * A JMeter thread only has a few requests in flight at a time, its embedded resources included, which
+     * a single I/O thread serves easily. HttpClient would otherwise start an I/O thread per processor for
+     * every client, and the clients of a JMeter thread are kept per host, which adds up to tens of
+     * thousands of threads in a large test. The threads are named after the JMeter thread they work for.
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void servesAllHostsOfAJMeterThreadWithASingleIoThread() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false));
+        server.start();
+        String owner = "io-thread-test-" + UUID.randomUUID();
+        ExecutorService jmeterThread = Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, owner));
+        try {
+            server.stubFor(get(urlEqualTo("/io")).willReturn(aResponse().withStatus(200)));
+            List<String> threadsWhileOpen = jmeterThread.submit(() -> {
+                for (String host : List.of("localhost", "127.0.0.1")) {
+                    HTTPSamplerBase sampler = newSampler();
+                    sampler.setHttpVersion("HTTP/2");
+                    HTTPSampleResult result = sampler.sample(
+                            new URL("https://" + host + ":" + server.httpsPort() + "/io"), HTTPConstants.GET, false, 1);
+                    assertEquals("200", result.getResponseCode(), result::getResponseMessage);
+                }
+                List<String> threads = httpClientThreadsOf(owner);
+                HTTPHC5Impl.closeClientsOfCurrentThread();
+                return threads;
+            }).get(30, TimeUnit.SECONDS);
+
+            // the I/O thread, and the one HttpClient starts the I/O reactor from, which idles until it is closed
+            assertEquals(2, threadsWhileOpen.size(),
+                    () -> "expected one client with a single I/O thread for both hosts, got " + threadsWhileOpen);
+            for (int attempt = 0; attempt < 100 && !httpClientThreadsOf(owner).isEmpty(); attempt++) {
+                Thread.sleep(100);
+            }
+            assertEquals(List.of(), httpClientThreadsOf(owner), "the threads should end when the client is closed");
+        } finally {
+            jmeterThread.shutdownNow();
+            server.stop();
+        }
+    }
+
+    private static List<String> httpClientThreadsOf(String owner) {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(Thread::isAlive)
+                .map(Thread::getName)
+                .filter(name -> name.startsWith(owner + " httpclient5"))
+                .sorted()
+                .toList();
     }
 
     /**
