@@ -248,6 +248,50 @@ class TestHTTPHC5Features {
     }
 
     /**
+     * The parallel downloads of embedded resources share the client of the thread, so its pool has to let each
+     * of them have a connection. With the default of HttpClient, five per host, the downloads beyond that would
+     * wait for a connection, which adds to their elapsed time.
+     */
+    @Test
+    void opensAConnectionForEachParallelDownloadOverHttp11() throws Exception {
+        HTTPSamplerBase.registerParser("text/html", LagartoBasedHtmlParser.class.getName());
+        WireMockServer server = createServer();
+        server.start();
+        try (TcpRelay relay = new TcpRelay(server.port())) {
+            int downloads = 8;
+            StringBuilder html = new StringBuilder("<html><body>");
+            for (int i = 0; i < downloads; i++) {
+                html.append("<img src='image").append(i).append(".png'>");
+                // slow enough for all of the downloads to be in progress at the same time
+                server.stubFor(get(urlEqualTo("/image" + i + ".png"))
+                        .willReturn(aResponse().withStatus(200).withFixedDelay(1000).withBody("image" + i)));
+            }
+            server.stubFor(get(urlEqualTo("/index.html")).willReturn(aResponse().withStatus(200)
+                    .withHeader("Content-Type", "text/html").withBody(html.append("</body></html>").toString())));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/1.1");
+            // as in the GUI, so connections are reused and only as many are opened as the pool allows at a time
+            sampler.setUseKeepAlive(true);
+            sampler.setImageParser(true);
+            sampler.setConcurrentDwn(true);
+            sampler.setConcurrentPool(Integer.toString(downloads));
+            sampler.setRunningVersion(true);
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("http://localhost:" + relay.getPort() + "/index.html"), HTTPConstants.GET, false, 0);
+
+            assertTrue(result.isSuccessful(), result::getResponseMessage);
+            assertEquals(downloads + 1, result.getSubResults().length, "the page and its embedded resources");
+            int connections = relay.getAcceptedConnections();
+            assertTrue(connections >= downloads,
+                    () -> "each of the " + downloads + " parallel downloads should have had a connection, but only "
+                            + connections + " were opened");
+        } finally {
+            server.stop();
+        }
+    }
+
+    /**
      * The threads which download embedded resources in parallel are pooled and shared by all JMeter
      * threads, so they must use the clients of the JMeter thread they are working for. Otherwise
      * they keep the clients of the thread that happened to create them, and a request is executed

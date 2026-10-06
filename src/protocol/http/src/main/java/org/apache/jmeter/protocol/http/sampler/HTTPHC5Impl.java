@@ -84,8 +84,8 @@ import org.apache.hc.client5.http.impl.async.HttpAsyncClients;
 import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
 import org.apache.hc.client5.http.impl.auth.KerberosSchemeFactory;
 import org.apache.hc.client5.http.impl.auth.SPNegoSchemeFactory;
-import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.impl.routing.DefaultRoutePlanner;
@@ -197,7 +197,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      * <p>The keys are weak, so that a context whose clients are never closed explicitly, like the
      * one of a thread of the HTTP(S) Test Script Recorder, does not keep the entry alive forever.
      */
-    private static final Map<JMeterContext, Map<HttpClientKey, CloseableHttpClient>> HTTP_CLIENTS =
+    private static final Map<JMeterContext, Map<HttpClientKey, HC5ClassicClient>> HTTP_CLIENTS =
             Collections.synchronizedMap(new WeakHashMap<>());
 
     /**
@@ -636,11 +636,28 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      */
     private RequestExecutor getRequestExecutor(HttpClientKey clientKey) {
         if (clientKey.httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_1) {
-            CloseableHttpClient client = getClient(clientKey);
-            return (request, context) -> client.executeOpen(null, request, context);
+            HC5ClassicClient client = getClient(clientKey);
+            client.allowConnectionsPerRoute(getParallelRequests());
+            return (request, context) -> client.client().executeOpen(null, request, context);
         }
         CloseableHttpAsyncClient client = getHttp2Client(clientKey);
         return (request, context) -> executeHttp2(client, request, context);
+    }
+
+    /**
+     * Number of requests the sampler makes to a host at the same time, which is the number of
+     * parallel downloads of its embedded resources, if it downloads them in parallel.
+     */
+    private int getParallelRequests() {
+        if (!testElement.isConcurrentDwn()) {
+            return 1;
+        }
+        try {
+            return Integer.parseInt(testElement.getConcurrentPool());
+        } catch (NumberFormatException e) {
+            // the sampler falls back to the default as well
+            return HTTPSamplerBase.CONCURRENT_POOL_SIZE;
+        }
     }
 
     private void setupRequest(URL url, org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
@@ -1235,8 +1252,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         saveConnectionCookies(headersOf(response), url, cookieManager);
     }
 
-    private static CloseableHttpClient getClient(HttpClientKey key) {
-        Map<HttpClientKey, CloseableHttpClient> clients =
+    private static HC5ClassicClient getClient(HttpClientKey key) {
+        Map<HttpClientKey, HC5ClassicClient> clients =
                 HTTP_CLIENTS.computeIfAbsent(JMeterContextService.getContext(), context -> new ConcurrentHashMap<>());
         return clients.computeIfAbsent(key, HTTPHC5Impl::createClient);
     }
@@ -1252,7 +1269,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return JMeterUtils.getPropDefault(DISABLE_DEFAULT_UA_PROPERTY, false);
     }
 
-    private static CloseableHttpClient createClient(HttpClientKey key) {
+    private static HC5ClassicClient createClient(HttpClientKey key) {
         org.apache.hc.client5.http.impl.classic.HttpClientBuilder builder = HttpClients.custom().disableAutomaticRetries();
         if (isDefaultUserAgentDisabled()) {
             builder.disableDefaultUserAgent();
@@ -1271,9 +1288,10 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             connectionConfig.setConnectTimeout(Timeout.ofMilliseconds(key.connectTimeout));
         }
         connectionManagerBuilder.setDefaultConnectionConfig(connectionConfig.build());
-        builder.setConnectionManager(new ConnectTimeMeasuringConnectionManager(connectionManagerBuilder.build()));
+        PoolingHttpClientConnectionManager pool = connectionManagerBuilder.build();
+        builder.setConnectionManager(new ConnectTimeMeasuringConnectionManager(pool));
         builder.setRoutePlanner(createRoutePlanner(key));
-        return builder.disableContentCompression()
+        return new HC5ClassicClient(builder.disableContentCompression()
                 // Cookies are left to the Cookie Manager, see AutoRedirectStrategy for those of redirects
                 .disableCookieManagement()
                 .setRedirectStrategy(AutoRedirectStrategy.INSTANCE)
@@ -1281,7 +1299,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 .setTargetAuthenticationStrategy(HC5Authentication.STRATEGY)
                 .setProxyAuthenticationStrategy(HC5Authentication.STRATEGY)
                 .addExecInterceptorFirst("response-content-encoding", RESPONSE_CONTENT_ENCODING)
-                .build();
+                .build(), pool);
     }
 
     private static CloseableHttpAsyncClient createHttp2Client(HttpClientKey key, JMeterContext jmeterContext) {
