@@ -51,6 +51,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
+import java.util.stream.Stream;
 
 import javax.net.ssl.SSLContext;
 import javax.security.auth.Subject;
@@ -60,14 +61,12 @@ import org.apache.hc.client5.http.HttpRoute;
 import org.apache.hc.client5.http.RouteInfo;
 import org.apache.hc.client5.http.SystemDefaultDnsResolver;
 import org.apache.hc.client5.http.async.methods.AbstractBinResponseConsumer;
-import org.apache.hc.client5.http.auth.AuthSchemeFactory;
 import org.apache.hc.client5.http.auth.AuthScope;
 import org.apache.hc.client5.http.auth.Credentials;
 import org.apache.hc.client5.http.auth.CredentialsProvider;
 import org.apache.hc.client5.http.auth.KerberosConfig;
 import org.apache.hc.client5.http.auth.KerberosCredentials;
 import org.apache.hc.client5.http.auth.StandardAuthScheme;
-import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
 import org.apache.hc.client5.http.classic.ExecChainHandler;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
@@ -83,9 +82,6 @@ import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
 import org.apache.hc.client5.http.impl.async.HttpAsyncClientBuilder;
 import org.apache.hc.client5.http.impl.async.HttpAsyncClients;
 import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
-import org.apache.hc.client5.http.impl.auth.BasicSchemeFactory;
-import org.apache.hc.client5.http.impl.auth.BearerSchemeFactory;
-import org.apache.hc.client5.http.impl.auth.DigestSchemeFactory;
 import org.apache.hc.client5.http.impl.auth.KerberosSchemeFactory;
 import org.apache.hc.client5.http.impl.auth.SPNegoSchemeFactory;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
@@ -188,6 +184,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     private static final String CONTEXT_ATTRIBUTE_RESPONSE_LATENCY = "__jmeter.S_R_LATENCY__"; //$NON-NLS-1$
     private static final String CONTEXT_ATTRIBUTE_RESPONSE_BODY_SIZE = "__jmeter.S_R_BODY_SIZE__"; //$NON-NLS-1$
     private static final String CONTEXT_ATTRIBUTE_RESPONSE_BODY_COUNTER = "__jmeter.S_R_BODY_COUNTER__"; //$NON-NLS-1$
+    private static final String CONTEXT_ATTRIBUTE_PREEMPTIVE_AUTHORIZATION = "__jmeter.PREEMPTIVE_AUTH__"; //$NON-NLS-1$
 
     /**
      * Clients of every JMeter thread, looked up by the {@link JMeterContext} of that thread instead
@@ -299,12 +296,13 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     /**
      * Auth schemes offered to a proxy that can be authenticated with Kerberos. Unlike the target
      * schemes these keep the password based schemes as a fallback, so that a proxy which offers
-     * {@code Negotiate} next to {@code Basic} or {@code Digest} can still be used.
+     * {@code Negotiate} next to {@code NTLM}, {@code Basic} or {@code Digest} can still be used.
      */
     @SuppressWarnings("deprecation") // The GSS based auth schemes of HttpClient 5 have no replacement yet
-    private static final List<String> KERBEROS_PROXY_PREFERRED_AUTH_SCHEMES =
-            List.of(StandardAuthScheme.SPNEGO, StandardAuthScheme.KERBEROS, StandardAuthScheme.BEARER,
-                    StandardAuthScheme.DIGEST, StandardAuthScheme.BASIC);
+    private static final List<String> KERBEROS_PROXY_PREFERRED_AUTH_SCHEMES = Stream.concat(
+                    Stream.of(StandardAuthScheme.SPNEGO, StandardAuthScheme.KERBEROS),
+                    HC5Authentication.SCHEME_PRIORITY.stream())
+            .toList();
 
     private static final Oid SPNEGO_OID = createOid("1.3.6.1.5.5.2");
 
@@ -526,6 +524,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     protected HTTPSampleResult sample(URL url, String method, boolean areFollowingRedirect, int frameDepth) {
         HTTPSampleResult result = createSampleResult(url, method);
         org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request = null;
+        HttpClientContext context = null;
         ClassicHttpResponse response = null;
         try {
             resetStateIfNeeded();
@@ -543,7 +542,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             interruptRequested = false;
             currentRequest = request;
             HttpClientKey clientKey = createHttpClientKey(url);
-            HttpClientContext context = createHttpClientContext(url, clientKey, request);
+            context = createHttpClientContext(url, clientKey, request);
             context.setAttribute(CONTEXT_ATTRIBUTE_SAMPLER_RESULT, result);
             response = executeRequest(url, clientKey, request, context);
             readResponse(response, result, context);
@@ -555,6 +554,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             currentRequest = null;
 
             updateResult(response, request, result);
+            reportPreemptiveAuthorization(context, result);
             updateUrlAfterAutoRedirects(url, context, result);
             if (cacheManager != null) {
                 cacheManager.saveDetails(cacheResponseHeaders(response), result);
@@ -571,6 +571,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             if (request != null) {
                 result.setRequestHeaders(getRequestHeaders(request));
                 result.setSentBytes(calculateSentBytes(request));
+                reportPreemptiveAuthorization(context, result);
             }
             return errorResult(e, result);
         } finally {
@@ -844,7 +845,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         HttpClientContext context = HttpClientContext.create();
         BasicCredentialsProvider credentialsProvider = new BasicCredentialsProvider();
         Authorization authorization = getAuthorizationForUrl(url);
-        configureTargetCredentials(url, request, credentialsProvider, authorization);
+        configureTargetCredentials(url, request, context, credentialsProvider, authorization);
         configureProxyCredentials(key, credentialsProvider);
         boolean kerberosTarget = isKerberos(authorization);
         boolean kerberosProxy = isKerberosProxy(key);
@@ -897,17 +898,36 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     }
 
     private static void configureTargetCredentials(URL url,
-            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
+            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context,
             BasicCredentialsProvider credentialsProvider, Authorization authorization) {
         if (authorization == null || isKerberos(authorization)) {
             // The credentials of a Kerberos authorization are used to log in to the KDC, they must
             // not be sent to the server
             return;
         }
-        credentialsProvider.setCredentials(new AuthScope(url.getHost(), getPort(url)),
-                new UsernamePasswordCredentials(authorization.getUser(), authorization.getPass().toCharArray()));
+        HC5Authentication.setTargetCredentials(credentialsProvider, url, authorization);
         if (AuthManager.Mechanism.BASIC.equals(authorization.getMechanism())) {
-            request.setHeader(HttpHeaders.AUTHORIZATION, authorization.toBasicHeader());
+            // The Authorization Manager takes precedence over an Authorization header of the Header
+            // Manager, which would also keep HttpClient from sending the credentials
+            request.removeHeaders(HttpHeaders.AUTHORIZATION);
+            String preemptiveAuthorization = HC5Authentication.preemptBasic(context, url, request, authorization);
+            if (preemptiveAuthorization != null) {
+                context.setAttribute(CONTEXT_ATTRIBUTE_PREEMPTIVE_AUTHORIZATION, preemptiveAuthorization);
+            }
+        }
+    }
+
+    /**
+     * Reports the {@code Authorization} header HttpClient sent pre-emptively with the request, as it is
+     * not part of the request JMeter built. It is not added to that request, as HttpClient reads it
+     * again whenever it answers a challenge.
+     */
+    private static void reportPreemptiveAuthorization(HttpContext context, HTTPSampleResult result) {
+        String header = context == null ? null
+                : (String) context.getAttribute(CONTEXT_ATTRIBUTE_PREEMPTIVE_AUTHORIZATION);
+        if (header != null) {
+            result.setRequestHeaders(result.getRequestHeaders() + HttpHeaders.AUTHORIZATION + ": " + header + "\n");
+            result.setSentBytes(result.getSentBytes() + HTTPMessageSizes.headerLength(HttpHeaders.AUTHORIZATION, header));
         }
     }
 
@@ -930,10 +950,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                         ? KerberosConfig.Option.ENABLE : KerberosConfig.Option.DEFAULT)
                 .build();
         DnsResolver dnsResolver = SystemDefaultDnsResolver.INSTANCE;
-        context.setAuthSchemeRegistry(RegistryBuilder.<AuthSchemeFactory>create()
-                .register(StandardAuthScheme.BASIC, BasicSchemeFactory.INSTANCE)
-                .register(StandardAuthScheme.DIGEST, DigestSchemeFactory.INSTANCE)
-                .register(StandardAuthScheme.BEARER, BearerSchemeFactory.INSTANCE)
+        context.setAuthSchemeRegistry(HC5Authentication.authSchemes()
                 .register(StandardAuthScheme.SPNEGO, new SPNegoSchemeFactory(kerberosConfig, dnsResolver))
                 .register(StandardAuthScheme.KERBEROS, new KerberosSchemeFactory(kerberosConfig, dnsResolver))
                 .build());
@@ -1043,13 +1060,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private static void configureProxyCredentials(HttpClientKey key, BasicCredentialsProvider credentialsProvider) {
         if (key.hasProxy && StringUtilities.isNotEmpty(key.proxyUser)) {
-            credentialsProvider.setCredentials(new AuthScope(key.proxyHost, key.proxyPort),
-                    new UsernamePasswordCredentials(key.proxyUser, key.proxyPass.toCharArray()));
+            HC5Authentication.setProxyCredentials(credentialsProvider, key.proxyHost, key.proxyPort, key.proxyUser,
+                    key.proxyPass);
         }
-    }
-
-    private static int getPort(URL url) {
-        return url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
     }
 
     private void readResponse(ClassicHttpResponse response, HTTPSampleResult result, HttpContext context)
@@ -1248,6 +1261,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 // Cookies are left to the Cookie Manager, see AutoRedirectStrategy for those of redirects
                 .disableCookieManagement()
                 .setRedirectStrategy(AutoRedirectStrategy.INSTANCE)
+                .setDefaultAuthSchemeRegistry(HC5Authentication.authSchemes().build())
+                .setTargetAuthenticationStrategy(HC5Authentication.STRATEGY)
+                .setProxyAuthenticationStrategy(HC5Authentication.STRATEGY)
                 .addExecInterceptorFirst("response-content-encoding", RESPONSE_CONTENT_ENCODING)
                 .build();
     }
@@ -1264,6 +1280,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 // Cookies are left to the Cookie Manager, see AutoRedirectStrategy for those of redirects
                 .disableCookieManagement()
                 .setRedirectStrategy(AutoRedirectStrategy.INSTANCE)
+                .setDefaultAuthSchemeRegistry(HC5Authentication.authSchemes().build())
+                .setTargetAuthenticationStrategy(HC5Authentication.STRATEGY)
+                .setProxyAuthenticationStrategy(HC5Authentication.STRATEGY)
                 // A JMeter thread only has a few requests in flight, which a single I/O thread serves
                 // easily, whereas HttpClient would start one per processor for every client
                 .setIOReactorConfig(IOReactorConfig.custom().setIoThreadCount(1).build())

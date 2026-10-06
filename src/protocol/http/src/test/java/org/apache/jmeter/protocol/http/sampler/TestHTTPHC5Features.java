@@ -1054,7 +1054,7 @@ class TestHTTPHC5Features {
         assertNotNull(authSchemes, "the Kerberos auth schemes have to be registered for the request");
         assertNotNull(authSchemes.lookup(StandardAuthScheme.SPNEGO), "Negotiate has to be supported");
         assertEquals(List.of(StandardAuthScheme.SPNEGO, StandardAuthScheme.KERBEROS, StandardAuthScheme.BEARER,
-                        StandardAuthScheme.DIGEST, StandardAuthScheme.BASIC),
+                        StandardAuthScheme.NTLM, StandardAuthScheme.DIGEST, StandardAuthScheme.BASIC),
                 new ArrayList<>(request.getConfig().getProxyPreferredAuthSchemes()),
                 "a proxy challenging with Negotiate has to be answered with a Kerberos token");
         assertNull(request.getConfig().getTargetPreferredAuthSchemes(),

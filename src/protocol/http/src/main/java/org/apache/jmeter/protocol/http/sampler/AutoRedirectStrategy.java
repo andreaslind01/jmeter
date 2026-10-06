@@ -24,8 +24,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-import org.apache.hc.client5.http.auth.AuthScope;
-import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
 import org.apache.hc.client5.http.impl.DefaultRedirectStrategy;
 import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
@@ -55,8 +53,8 @@ import org.slf4j.LoggerFactory;
  * <ul>
  * <li>The cookies a redirect sets are stored in the Cookie Manager, against the URL of the redirect.</li>
  * <li>The {@code Cookie} header holds the cookies of the Cookie Manager for the URL of the hop.</li>
- * <li>The {@code Authorization} header holds the pre-emptive Basic credentials of the Authorization
- * Manager for that URL, whose credentials also answer a challenge of the host of the hop.</li>
+ * <li>The credentials of the Authorization Manager for that URL answer a challenge of the host of the hop,
+ * and those of an entry with the BASIC mechanism are sent pre-emptively, see {@link HC5Authentication}.</li>
  * <li>A {@code Cookie} or {@code Authorization} header of the Header Manager is only sent to the origin
  * of the sampled URL, and only where the managers do not replace it, as for the initial request.</li>
  * </ul>
@@ -101,7 +99,7 @@ final class AutoRedirectStrategy extends DefaultRedirectStrategy {
             log.debug("Not applying the managers to the redirect to {}", newTarget, e);
             return super.isRedirectAllowed(currentTarget, newTarget, redirect, context);
         }
-        hops.next(HttpClientContext.cast(context).getResponse(), url, redirect);
+        hops.next(HttpClientContext.cast(context), url, redirect);
         return true;
     }
 
@@ -133,11 +131,12 @@ final class AutoRedirectStrategy extends DefaultRedirectStrategy {
         /**
          * Prepares the request of the next hop.
          *
-         * @param redirect the response being redirected
-         * @param url      URL of the next hop
-         * @param request  request of the next hop
+         * @param context context of the sample, which holds the response being redirected
+         * @param url     URL of the next hop
+         * @param request request of the next hop
          */
-        void next(HttpResponse redirect, URL url, HttpRequest request) {
+        void next(HttpClientContext context, URL url, HttpRequest request) {
+            HttpResponse redirect = context.getResponse();
             if (redirect != null) {
                 HTTPHCAbstractImpl.saveConnectionCookies(action -> {
                     for (Header header : redirect.getHeaders()) {
@@ -160,12 +159,10 @@ final class AutoRedirectStrategy extends DefaultRedirectStrategy {
             boolean kerberos = authorization != null
                     && AuthManager.Mechanism.KERBEROS.equals(authorization.getMechanism());
             if (authorization != null && !kerberos) {
-                credentials.setCredentials(new AuthScope(url.getHost(), getPort(url)),
-                        new UsernamePasswordCredentials(authorization.getUser(),
-                                authorization.getPass().toCharArray()));
+                HC5Authentication.setTargetCredentials(credentials, url, authorization);
             }
             if (authorization != null && AuthManager.Mechanism.BASIC.equals(authorization.getMechanism())) {
-                request.setHeader(HttpHeaders.AUTHORIZATION, authorization.toBasicHeader());
+                HC5Authentication.preemptBasic(context, url, request, authorization);
             } else if (sampledOrigin) {
                 headerManagerAuthorizations.forEach(value -> request.addHeader(HttpHeaders.AUTHORIZATION, value));
             }

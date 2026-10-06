@@ -3744,6 +3744,15 @@ information for the user named, "<code>jmeter</code>".</property>
 <note>
 The Realm only applies to the HttpClient sampler.
 </note>
+<note>
+With the HttpClient 4 and HttpClient 5 implementations, a server that asks for <code>NTLM</code> is answered with the
+<code>Username</code>, <code>Password</code> and <code>Domain</code> of the entry, whatever its <code>Mechanism</code>,
+unless it is <code>Kerberos</code>. A proxy that asks for <code>NTLM</code> is answered with the proxy user of the sampler
+and the domain of the <code>http.proxyDomain</code> property. The <code>BASIC</code> mechanism sends the credentials
+pre-emptively, and a challenge for another scheme, like <code>NTLM</code> or <code>DIGEST</code>, is still answered.
+<code>NTLM</code> authenticates the connection rather than the request, which HTTP/2 does not allow, so select
+<code>HTTP/1.1</code> as HTTP version of the HttpClient 5 implementation for a server that asks for it.
+</note>
 <br></br>
 <b>Kerberos Configuration:</b>
 <p>To configure Kerberos you need to setup at least two JVM system properties:</p>
