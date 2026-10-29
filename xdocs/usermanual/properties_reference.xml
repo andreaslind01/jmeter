@@ -444,8 +444,9 @@ JMETER-SERVER</source>
 <property name="httpclient.version">
     Set the default HTTP version for HttpClient5, OkHttp and Java samplers with an empty HTTP Version value.<br/>
     Valid values are <code>HTTP/1.1</code>, <code>HTTP/2</code> and, for HttpClient5 only,
-    <code>HTTP/2 Strict</code>. The legacy values <code>1.0</code> and <code>1.1</code> are still
-    accepted and both select <code>HTTP/1.1</code> for these samplers.<br/>
+    <code>HTTP/2 Strict</code>.
+    The legacy values <code>1.0</code> and <code>1.1</code> are still accepted and both select
+    <code>HTTP/1.1</code> for these samplers.<br/>
     The AJP sampler only reads this property to choose the HTTP version of its request line: the
     legacy value <code>1.0</code> (or <code>HTTP/1.0</code>) announces <code>HTTP/1.0</code>, every
     other value announces <code>HTTP/1.1</code>.<br/>
@@ -462,13 +463,25 @@ JMETER-SERVER</source>
 <property name="httpclient5.h2.multiplexing">
     Multiplex concurrent message exchanges (for example parallel downloads of embedded resources)
     over a single HTTP/2 connection. The connections are not shared between threads, every JMeter
-    thread uses connections of its own.<br/>
+    thread uses connections of its own. A request which exceeds its response timeout or is interrupted
+    closes the shared connection, which fails the other requests in flight over it as well. Set to
+    <code>false</code> to give each concurrent request a connection of its own.<br/>
     Defaults to: <code>true</code>
 </property>
 <property name="httpclient5.h2.max_connections_per_route">
-    Maximum number of HTTP/2 connections kept per target host. With multiplexing enabled a single
-    connection usually serves all concurrent requests.<br/>
+    Maximum number of connections kept per target host by the client that the HttpClient5
+    implementation uses when HTTP/2 is selected. With multiplexing enabled a single connection
+    usually serves all concurrent requests. When the server negotiates HTTP/1.1 instead, or
+    multiplexing is disabled, every concurrent request needs a connection of its own, and the requests
+    beyond this limit wait for one, which counts in their elapsed time. Set it to at least the number of
+    parallel downloads of embedded resources then, as unlike with HTTP/1.1 selected, the limit is not
+    raised to that number automatically.<br/>
     Defaults to: <code>6</code>
+</property>
+<property name="httpclient5.h2.body_spill_threshold">
+    Number of bytes of an HTTP/2 request body buffered in memory before it is spilled to a temporary
+    file.<br/>
+    Defaults to: <code>262144</code>
 </property>
 <property name="httpclient5.h2.header_table_size">
     Size in bytes of the HPACK dynamic header table announced to the server.
@@ -487,8 +500,8 @@ JMETER-SERVER</source>
     HTTP/2 flow control window in bytes announced per stream. It caps how many bytes the server may
     send before it has to wait for a window update, so the throughput of a single response cannot
     exceed this window divided by the round trip time. The HTTP/2 default of <code>65535</code>
-    throttles downloads over links with any noticeable latency, therefore JMeter announces the same
-    window as the Java sampler implementation.<br/>
+    throttles downloads over links with any noticeable latency, therefore JMeter announces a larger
+    window.<br/>
     Defaults to: <code>16777216</code>
 </property>
 <property name="httpclient5.h2.max_frame_size">

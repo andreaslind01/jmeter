@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -39,6 +40,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -46,6 +48,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPOutputStream;
 
 import org.apache.hc.client5.http.HttpRoute;
 import org.apache.hc.client5.http.auth.AuthSchemeFactory;
@@ -77,8 +80,11 @@ import org.apache.jmeter.threads.JMeterContext;
 import org.apache.jmeter.threads.JMeterContextService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.http.HttpHeader;
@@ -184,6 +190,102 @@ class TestHTTPHC5Features {
             assertEquals(1, relay.getAcceptedConnections(),
                     "the concurrent samples should have been multiplexed over the established connection "
                             + "instead of opening a connection each");
+        } finally {
+            server.stop();
+        }
+    }
+
+    /**
+     * A JMeter thread only has a few requests in flight at a time, its embedded resources included, which
+     * a single I/O thread serves easily. HttpClient would otherwise start an I/O thread per processor for
+     * every client, and the clients of a JMeter thread are kept per host, which adds up to tens of
+     * thousands of threads in a large test. The threads are named after the JMeter thread they work for.
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void servesAllHostsOfAJMeterThreadWithASingleIoThread() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false));
+        server.start();
+        String owner = "io-thread-test-" + UUID.randomUUID();
+        ExecutorService jmeterThread = Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, owner));
+        try {
+            server.stubFor(get(urlEqualTo("/io")).willReturn(aResponse().withStatus(200)));
+            List<String> threadsWhileOpen = jmeterThread.submit(() -> {
+                for (String host : List.of("localhost", "127.0.0.1")) {
+                    HTTPSamplerBase sampler = newSampler();
+                    sampler.setHttpVersion("HTTP/2");
+                    HTTPSampleResult result = sampler.sample(
+                            new URL("https://" + host + ":" + server.httpsPort() + "/io"), HTTPConstants.GET, false, 1);
+                    assertEquals("200", result.getResponseCode(), result::getResponseMessage);
+                }
+                List<String> threads = httpClientThreadsOf(owner);
+                HTTPHC5Impl.closeClientsOfCurrentThread();
+                return threads;
+            }).get(30, TimeUnit.SECONDS);
+
+            // the I/O thread, and the one HttpClient starts the I/O reactor from, which idles until it is closed
+            assertEquals(2, threadsWhileOpen.size(),
+                    () -> "expected one client with a single I/O thread for both hosts, got " + threadsWhileOpen);
+            for (int attempt = 0; attempt < 100 && !httpClientThreadsOf(owner).isEmpty(); attempt++) {
+                Thread.sleep(100);
+            }
+            assertEquals(List.of(), httpClientThreadsOf(owner), "the threads should end when the client is closed");
+        } finally {
+            jmeterThread.shutdownNow();
+            server.stop();
+        }
+    }
+
+    private static List<String> httpClientThreadsOf(String owner) {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(Thread::isAlive)
+                .map(Thread::getName)
+                .filter(name -> name.startsWith(owner + " httpclient5"))
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * The parallel downloads of embedded resources share the client of the thread, so its pool has to let each
+     * of them have a connection. With the default of HttpClient, five per host, the downloads beyond that would
+     * wait for a connection, which adds to their elapsed time.
+     */
+    @Test
+    void opensAConnectionForEachParallelDownloadOverHttp11() throws Exception {
+        HTTPSamplerBase.registerParser("text/html", LagartoBasedHtmlParser.class.getName());
+        WireMockServer server = createServer();
+        server.start();
+        try (TcpRelay relay = new TcpRelay(server.port())) {
+            int downloads = 8;
+            StringBuilder html = new StringBuilder("<html><body>");
+            for (int i = 0; i < downloads; i++) {
+                html.append("<img src='image").append(i).append(".png'>");
+                // slow enough for all of the downloads to be in progress at the same time
+                server.stubFor(get(urlEqualTo("/image" + i + ".png"))
+                        .willReturn(aResponse().withStatus(200).withFixedDelay(1000).withBody("image" + i)));
+            }
+            server.stubFor(get(urlEqualTo("/index.html")).willReturn(aResponse().withStatus(200)
+                    .withHeader("Content-Type", "text/html").withBody(html.append("</body></html>").toString())));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/1.1");
+            // as in the GUI, so connections are reused and only as many are opened as the pool allows at a time
+            sampler.setUseKeepAlive(true);
+            sampler.setImageParser(true);
+            sampler.setConcurrentDwn(true);
+            sampler.setConcurrentPool(Integer.toString(downloads));
+            sampler.setRunningVersion(true);
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("http://localhost:" + relay.getPort() + "/index.html"), HTTPConstants.GET, false, 0);
+
+            assertTrue(result.isSuccessful(), result::getResponseMessage);
+            assertEquals(downloads + 1, result.getSubResults().length, "the page and its embedded resources");
+            int connections = relay.getAcceptedConnections();
+            assertTrue(connections >= downloads,
+                    () -> "each of the " + downloads + " parallel downloads should have had a connection, but only "
+                            + connections + " were opened");
         } finally {
             server.stop();
         }
@@ -448,6 +550,62 @@ class TestHTTPHC5Features {
         }
     }
 
+    /**
+     * Only the MD5 digest of the body is stored, which must not make the sample report the size of the
+     * digest instead of the bytes that were received, which is what Received KB/sec is computed from. A
+     * compressed body is reported with its compressed size. HttpClient4 is the reference.
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "HttpClient4, HTTP/1.1, identity",
+            "HttpClient4, HTTP/1.1, gzip",
+            "HttpClient5, HTTP/1.1, identity",
+            "HttpClient5, HTTP/1.1, gzip",
+            "HttpClient5, HTTP/2, identity",
+            "HttpClient5, HTTP/2, gzip"})
+    void reportsTheReceivedBodySizeWhenOnlyTheMd5IsStored(String implementation, String httpVersion,
+            String contentEncoding) throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false)
+                .gzipDisabled(true));
+        try {
+            server.start();
+            byte[] body = new byte[200_000];
+            for (int i = 0; i < body.length; i++) {
+                body[i] = (byte) (i % 251);
+            }
+            byte[] sent = "gzip".equals(contentEncoding) ? gzip(body) : body;
+            ResponseDefinitionBuilder response = aResponse().withStatus(200)
+                    .withHeader(HttpHeaders.CONTENT_LENGTH, Integer.toString(sent.length))
+                    .withBody(sent);
+            if ("gzip".equals(contentEncoding)) {
+                response.withHeader(HttpHeaders.CONTENT_ENCODING, contentEncoding);
+            }
+            server.stubFor(get(urlEqualTo("/md5")).willReturn(response));
+            HTTPSamplerBase sampler = HTTPSamplerFactory.newInstance(implementation);
+            sampler.setHttpVersion(httpVersion);
+            sampler.setMD5(true);
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("https://localhost:" + server.httpsPort() + "/md5"), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode(), result::getResponseMessage);
+            assertEquals(32, result.getResponseData().length, "only the MD5 digest should be stored");
+            assertEquals(sent.length, result.getBodySizeAsLong(), "the received body size should be reported");
+        } finally {
+            server.stop();
+        }
+    }
+
+    private static byte[] gzip(byte[] data) throws IOException {
+        ByteArrayOutputStream compressed = new ByteArrayOutputStream();
+        try (GZIPOutputStream out = new GZIPOutputStream(compressed)) {
+            out.write(data);
+        }
+        return compressed.toByteArray();
+    }
+
     @Test
     void interruptsPendingHttp2Request() throws Exception {
         WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
@@ -501,6 +659,106 @@ class TestHTTPHC5Features {
         } finally {
             server.stop();
         }
+    }
+
+    /**
+     * HttpClient applies the response timeout only to HTTP/1.1 connections, as it can set it as socket
+     * timeout of the connection only, which all streams of an HTTP/2 connection share. A server that
+     * accepts the stream and never answers must still fail the sample once the timeout expires, like it
+     * does over HTTP/1.1, instead of blocking the thread until the test is stopped.
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void failsNegotiatedHttp2SampleWhenServerDoesNotRespondWithinResponseTimeout() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false));
+        server.start();
+        try {
+            server.stubFor(get(urlEqualTo("/silent")).willReturn(aResponse().withStatus(200).withFixedDelay(20_000)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+            sampler.setResponseTimeout("1000");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("https://localhost:" + server.httpsPort() + "/silent"), HTTPConstants.GET, false, 1);
+
+            assertResponseTimedOut(result);
+        } finally {
+            server.stop();
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void failsStrictHttp2SampleWhenServerDoesNotRespondWithinResponseTimeout() throws Exception {
+        try (StallingHttp2Server server = new StallingHttp2Server(false)) {
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2 Strict");
+            sampler.setResponseTimeout("1000");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("http://localhost:" + server.getPort() + "/silent"), HTTPConstants.GET, false, 1);
+
+            assertResponseTimedOut(result);
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void failsHttp2SampleWhenResponseBodyStallsLongerThanResponseTimeout() throws Exception {
+        try (StallingHttp2Server server = new StallingHttp2Server(true)) {
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2 Strict");
+            sampler.setResponseTimeout("1000");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("http://localhost:" + server.getPort() + "/stalled"), HTTPConstants.GET, false, 1);
+
+            assertResponseTimedOut(result);
+        }
+    }
+
+    /**
+     * The response timeout limits each wait for the server, not the whole exchange, so a response that
+     * keeps arriving in chunks must not fail even though it takes longer than the timeout in total.
+     */
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void doesNotFailHttp2SampleWhileResponseDataKeepsArrivingWithinResponseTimeout() throws Exception {
+        WireMockServer server = new WireMockServer(WireMockConfiguration.wireMockConfig()
+                .dynamicHttpsPort()
+                .http2TlsDisabled(false));
+        server.start();
+        try {
+            // a chunk every 250 ms, so the exchange takes about 2.5 s, well beyond the timeout
+            server.stubFor(get(urlEqualTo("/trickle"))
+                    .willReturn(aResponse().withStatus(200).withBody(new byte[10_000]).withChunkedDribbleDelay(10, 2_500)));
+            HTTPSamplerBase sampler = newSampler();
+            sampler.setHttpVersion("HTTP/2");
+            sampler.setResponseTimeout("1500");
+
+            HTTPSampleResult result = sampler.sample(
+                    new URL("https://localhost:" + server.httpsPort() + "/trickle"), HTTPConstants.GET, false, 1);
+
+            assertEquals("200", result.getResponseCode(), result::getResponseMessage);
+            assertEquals("HTTP/2", result.getResponseHeaders().substring(0, "HTTP/2".length()));
+            assertEquals(10_000, result.getResponseData().length);
+            assertTrue(result.getTime() > 1500,
+                    () -> "the exchange should have taken longer than the response timeout, but took "
+                            + result.getTime() + " ms");
+        } finally {
+            server.stop();
+        }
+    }
+
+    private static void assertResponseTimedOut(HTTPSampleResult result) {
+        assertFalse(result.isSuccessful(), "the sample should have failed with a response timeout");
+        assertEquals("Non HTTP response code: java.net.SocketTimeoutException", result.getResponseCode(),
+                result::getResponseMessage);
+        assertTrue(result.getTime() >= 900 && result.getTime() < 10_000,
+                () -> "the sample should have failed after the response timeout of 1000 ms, but took "
+                        + result.getTime() + " ms");
     }
 
     @Test
@@ -659,7 +917,7 @@ class TestHTTPHC5Features {
         StringBuilder head = new StringBuilder()
                 .append(request.getMethod().getName()).append(' ')
                 .append(request.getUrl()).append(' ')
-                .append(HTTPConstants.HTTP_VERSION_1_1).append("\r\n");
+                .append(HTTPConstants.HTTP_1_1).append("\r\n");
         for (HttpHeader header : request.getHeaders().all()) {
             for (String value : header.values()) {
                 head.append(header.key()).append(": ").append(value).append("\r\n");
@@ -840,7 +1098,7 @@ class TestHTTPHC5Features {
         assertNotNull(authSchemes, "the Kerberos auth schemes have to be registered for the request");
         assertNotNull(authSchemes.lookup(StandardAuthScheme.SPNEGO), "Negotiate has to be supported");
         assertEquals(List.of(StandardAuthScheme.SPNEGO, StandardAuthScheme.KERBEROS, StandardAuthScheme.BEARER,
-                        StandardAuthScheme.DIGEST, StandardAuthScheme.BASIC),
+                        StandardAuthScheme.NTLM, StandardAuthScheme.DIGEST, StandardAuthScheme.BASIC),
                 new ArrayList<>(request.getConfig().getProxyPreferredAuthSchemes()),
                 "a proxy challenging with Negotiate has to be answered with a Kerberos token");
         assertNull(request.getConfig().getTargetPreferredAuthSchemes(),

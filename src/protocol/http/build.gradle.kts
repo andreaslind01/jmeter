@@ -80,13 +80,10 @@ dependencies {
     implementation("com.fasterxml.jackson.core:jackson-databind")
     testImplementation(testFixtures(projects.src.core))
     testImplementation(testFixtures(projects.src.testkitWiremock))
-    testImplementation("org.wiremock:wiremock")
-    // For some reason JMeter bundles just tika-core and tika-parsers without transitive
-    // dependencies. So we exclude those
+    testImplementation("org.wiremock:wiremock-jetty12")
+    // JMeter bundles just tika-core (without transitive dependencies) for MIME-type
+    // detection. Document parsing relies on a user-supplied tika-app.jar at runtime.
     implementation("org.apache.tika:tika-core") {
-        isTransitive = false
-    }
-    runtimeOnly("org.apache.tika:tika-parsers") {
         isTransitive = false
     }
 }

@@ -241,7 +241,11 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
         }
     }
 
-    static Map<HttpClientKey, Http2Client> getHttp2Clients() {
+    static Map<?, ?> getHttp2Clients() {
+        return getHttp2ClientCache();
+    }
+
+    private static Map<HttpClientKey, Http2Client> getHttp2ClientCache() {
         if (SHARE_HTTP_2_CONNECTIONS_BETWEEN_THREADS) {
             return SHARED_HTTP_2_CLIENTS;
         }
@@ -468,7 +472,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
      *
      * @param conn
      *            <code>URLConnection</code> to set headers on
-     * @exception IOException
+     * @throws IOException
      *                if an I/O exception occurs
      */
     protected void setPostHeaders(URLConnection conn) throws IOException {
@@ -488,7 +492,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
      * @param connection
      *            <code>URLConnection</code> where POST data should be sent
      * @return a String show what was posted. Will not contain actual file upload content
-     * @exception IOException
+     * @throws IOException
      *                if an I/O exception occurs
      */
     protected String sendPostData(URLConnection connection) throws IOException {
@@ -513,7 +517,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
      * @param res
      *            sample result to save request infos to
      * @return connection and security headers ready for .connect
-     * @exception IOException
+     * @throws IOException
      *                if an I/O Exception occurs
      */
     protected ConnectionSetup setupConnection(URL u, String method, HTTPSampleResult res) throws IOException {
@@ -608,7 +612,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
      * @param res
      *            {@link SampleResult} to read response into
      * @return response content
-     * @exception IOException
+     * @throws IOException
      *                if an I/O exception occurs
      */
     protected byte[] readResponse(HttpURLConnection conn, SampleResult res) throws IOException {
@@ -1536,7 +1540,7 @@ public class HTTPJavaImpl extends HTTPAbstractImpl {
         HttpClientKey key = new HttpClientKey(connectTimeout, proxyHost, proxyPort,
                 proxyUser, proxyPass, autoRedirects, sslContext != null);
 
-        Map<HttpClientKey, Http2Client> clients = getHttp2Clients();
+        Map<HttpClientKey, Http2Client> clients = getHttp2ClientCache();
         // Only the JMeter thread that owns the clients replaces one when its SSLContext was reset.
         // A thread which downloads embedded resources has an SSLContext of its own, which never is
         // the one of the client, so it has to keep the client of the JMeter thread it works for.
