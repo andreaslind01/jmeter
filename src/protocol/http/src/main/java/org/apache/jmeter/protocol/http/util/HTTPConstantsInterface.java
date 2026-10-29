@@ -39,11 +39,15 @@ public interface HTTPConstantsInterface { // CHECKSTYLE IGNORE InterfaceIsType
      * Value of the sampler {@code HTTPSampler.httpVersion} property which uses HTTP/2 if the server
      * agrees to it, falling back to HTTP/1.1 otherwise. It is also the protocol version as it appears
      * on the wire and in the request/response headers of a sample.
+     *
+     * @since 6.0
      */
     String HTTP_VERSION_2 = "HTTP/2"; // $NON-NLS-1$
     /**
      * Value of the sampler {@code HTTPSampler.httpVersion} property which requires HTTP/2, so a
      * server that does not support it fails the sample instead of being used with HTTP/1.1.
+     *
+     * @since 6.0
      */
     String HTTP_VERSION_2_STRICT = "HTTP/2 Strict"; // $NON-NLS-1$
     String HEAD = "HEAD"; // $NON-NLS-1$
@@ -74,7 +78,11 @@ public interface HTTPConstantsInterface { // CHECKSTYLE IGNORE InterfaceIsType
     // e.g. "Transfer-Encoding: chunked", which is processed automatically by the underlying protocol
     String TRANSFER_ENCODING = "transfer-encoding"; // $NON-NLS-1$
     String HEADER_CONTENT_ENCODING = "content-encoding"; // $NON-NLS-1$
-    String HTTP_1_1 = "HTTP/1.1"; // $NON-NLS-1$
+    /**
+     * HTTP/1.1 protocol version. It is also the value of the sampler {@code HTTPSampler.httpVersion}
+     * property which forces HTTP/1.1.
+     */
+    String HTTP_1_1 = HTTP_VERSION_1_1;
     String HEADER_SET_COOKIE = "set-cookie"; // $NON-NLS-1$
     // Brotli compression not supported yet by HC4 4.5.2 , but to be added
     String ENCODING_BROTLI = "br"; // $NON-NLS-1$

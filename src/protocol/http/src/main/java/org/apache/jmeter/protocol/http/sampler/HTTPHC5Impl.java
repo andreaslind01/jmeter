@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.MalformedURLException;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -38,17 +39,17 @@ import java.security.Principal;
 import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
-import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.stream.Stream;
 
 import javax.net.ssl.SSLContext;
 import javax.security.auth.Subject;
@@ -58,14 +59,12 @@ import org.apache.hc.client5.http.HttpRoute;
 import org.apache.hc.client5.http.RouteInfo;
 import org.apache.hc.client5.http.SystemDefaultDnsResolver;
 import org.apache.hc.client5.http.async.methods.AbstractBinResponseConsumer;
-import org.apache.hc.client5.http.auth.AuthSchemeFactory;
 import org.apache.hc.client5.http.auth.AuthScope;
 import org.apache.hc.client5.http.auth.Credentials;
 import org.apache.hc.client5.http.auth.CredentialsProvider;
 import org.apache.hc.client5.http.auth.KerberosConfig;
 import org.apache.hc.client5.http.auth.KerberosCredentials;
 import org.apache.hc.client5.http.auth.StandardAuthScheme;
-import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
 import org.apache.hc.client5.http.classic.ExecChainHandler;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
@@ -81,13 +80,10 @@ import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
 import org.apache.hc.client5.http.impl.async.HttpAsyncClientBuilder;
 import org.apache.hc.client5.http.impl.async.HttpAsyncClients;
 import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
-import org.apache.hc.client5.http.impl.auth.BasicSchemeFactory;
-import org.apache.hc.client5.http.impl.auth.BearerSchemeFactory;
-import org.apache.hc.client5.http.impl.auth.DigestSchemeFactory;
 import org.apache.hc.client5.http.impl.auth.KerberosSchemeFactory;
 import org.apache.hc.client5.http.impl.auth.SPNegoSchemeFactory;
-import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.impl.routing.DefaultRoutePlanner;
@@ -103,6 +99,7 @@ import org.apache.hc.client5.http.ssl.HostnameVerificationPolicy;
 import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
 import org.apache.hc.client5.http.ssl.TlsSocketStrategy;
 import org.apache.hc.client5.http.utils.URIUtils;
+import org.apache.hc.core5.concurrent.DefaultThreadFactory;
 import org.apache.hc.core5.concurrent.FutureCallback;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ContentType;
@@ -135,9 +132,9 @@ import org.apache.hc.core5.http.protocol.HttpContext;
 import org.apache.hc.core5.http2.HttpVersionPolicy;
 import org.apache.hc.core5.http2.config.H2Config;
 import org.apache.hc.core5.io.CloseMode;
-import org.apache.hc.core5.net.URIAuthority;
 import org.apache.hc.core5.pool.PoolConcurrencyPolicy;
 import org.apache.hc.core5.reactor.ConnectionInitiator;
+import org.apache.hc.core5.reactor.IOReactorConfig;
 import org.apache.hc.core5.util.TimeValue;
 import org.apache.hc.core5.util.Timeout;
 import org.apache.hc.core5.util.VersionInfo;
@@ -155,12 +152,12 @@ import org.apache.jmeter.services.FileServer;
 import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.threads.JMeterContext;
 import org.apache.jmeter.threads.JMeterContextService;
+import org.apache.jmeter.threads.JMeterThread;
 import org.apache.jmeter.threads.JMeterVariables;
 import org.apache.jmeter.util.JMeterUtils;
 import org.apache.jmeter.util.JsseSSLManager;
 import org.apache.jmeter.util.SSLManager;
 import org.apache.jorphan.io.CountingInputStream;
-import org.apache.jorphan.io.CountingOutputStream;
 import org.apache.jorphan.util.JOrphanUtils;
 import org.apache.jorphan.util.StringUtilities;
 import org.brotli.dec.BrotliInputStream;
@@ -173,6 +170,8 @@ import org.slf4j.LoggerFactory;
 
 /**
  * HTTP Sampler using Apache HttpClient 5.x.
+ *
+ * @since 6.0
  */
 public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
@@ -185,25 +184,26 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     private static final String CONTEXT_ATTRIBUTE_RESPONSE_BODY_COUNTER = "__jmeter.S_R_BODY_COUNTER__"; //$NON-NLS-1$
 
     /**
-     * Clients of every JMeter thread, looked up by the {@link JMeterContext} of that thread instead
-     * of by the thread itself. The threads that download embedded resources in parallel are pooled
-     * and shared by all JMeter threads, and they adopt the context of the JMeter thread they are
-     * working for, so looking the clients up by context hands them the clients of that thread. That
-     * shares a connection between a sample and its embedded resources, which lets HTTP/2 multiplex
-     * them, and it keeps a JMeter thread from closing clients another one is still using.
+     * Name of the {@link JMeterContext#getThreadState() thread state} entry which holds the clients
+     * of a JMeter thread. They are looked up by the {@link JMeterContext} of that thread instead of
+     * by the thread itself. The threads that download embedded resources in parallel are pooled and
+     * shared by all JMeter threads, and they adopt the context of the JMeter thread they are working
+     * for, so looking the clients up by context hands them the clients of that thread. That shares a
+     * connection between a sample and its embedded resources, which lets HTTP/2 multiplex them, and
+     * it keeps a JMeter thread from closing clients another one is still using.
      *
-     * <p>The keys are weak, so that a context whose clients are never closed explicitly, like the
-     * one of a thread of the HTTP(S) Test Script Recorder, does not keep the entry alive forever.
+     * <p>The clients are closed when their owning JMeter thread finishes. This explicit cleanup is
+     * important for HTTP/2: its I/O threads share the context, so they can keep the context and its
+     * clients reachable until {@link #closeClientsOfCurrentThread()} closes them.
      */
-    private static final Map<JMeterContext, Map<HttpClientKey, CloseableHttpClient>> HTTP_CLIENTS =
-            Collections.synchronizedMap(new WeakHashMap<>());
+    private static final String THREAD_STATE_CLIENTS = "__jmeter.HC5_CLIENTS__"; //$NON-NLS-1$
 
     /**
-     * HTTP/2 clients of every JMeter thread, see {@link #HTTP_CLIENTS} for how they are shared with
-     * the threads that download embedded resources in parallel.
+     * Name of the {@link JMeterContext#getThreadState() thread state} entry which holds the HTTP/2
+     * clients of a JMeter thread, see {@link #THREAD_STATE_CLIENTS} for how they are shared with the
+     * threads that download embedded resources in parallel.
      */
-    private static final Map<JMeterContext, Map<HttpClientKey, CloseableHttpAsyncClient>> HTTP_2_CLIENTS =
-            Collections.synchronizedMap(new WeakHashMap<>());
+    private static final String THREAD_STATE_HTTP_2_CLIENTS = "__jmeter.HC5_HTTP_2_CLIENTS__"; //$NON-NLS-1$
 
     /** Multiplex concurrent message exchanges over a single HTTP/2 connection. */
     private static final boolean HTTP_2_MULTIPLEXING =
@@ -215,9 +215,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      * for a window update, so the throughput of a single response can never exceed this window divided by
      * the round trip time. The default of HttpClient is the 64 kB the HTTP/2 specification mandates, which
      * throttles a download over a link with any noticeable latency to a fraction of the available
-     * bandwidth. JMeter therefore announces the same 16 MB the JDK client uses by default, see
-     * {@code http.java.h2.initial_window_size}. The window is only a promise to the server, the body is
-     * consumed as it arrives and not buffered up to this size.
+     * bandwidth. JMeter therefore announces the same 16 MB the JDK client uses by default. The window
+     * is only a promise to the server, the body is consumed as it arrives and not buffered up to this
+     * size.
      */
     static final int DEFAULT_HTTP_2_INITIAL_WINDOW_SIZE = 16 * 1024 * 1024;
 
@@ -228,6 +228,12 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     private static final boolean HTTP_2_PRIOR_KNOWLEDGE =
             JMeterUtils.getPropDefault("httpclient5.h2.prior_knowledge", false);
 
+    /**
+     * Connections per host of the HTTP/2 client. Unlike {@link HC5ClassicClient#allowConnectionsPerRoute(int)}
+     * this maximum is not raised to the parallel downloads, as HttpClient only shares an HTTP/2 connection
+     * once it is open, so a burst of downloads to a host would open that many HTTP/2 connections. A server
+     * that negotiates HTTP/1.1 through ALPN therefore needs the property raised.
+     */
     private static final int HTTP_2_MAX_CONNECTIONS_PER_ROUTE =
             JMeterUtils.getPropDefault("httpclient5.h2.max_connections_per_route", 6);
 
@@ -294,12 +300,13 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     /**
      * Auth schemes offered to a proxy that can be authenticated with Kerberos. Unlike the target
      * schemes these keep the password based schemes as a fallback, so that a proxy which offers
-     * {@code Negotiate} next to {@code Basic} or {@code Digest} can still be used.
+     * {@code Negotiate} next to {@code NTLM}, {@code Basic} or {@code Digest} can still be used.
      */
     @SuppressWarnings("deprecation") // The GSS based auth schemes of HttpClient 5 have no replacement yet
-    private static final List<String> KERBEROS_PROXY_PREFERRED_AUTH_SCHEMES =
-            List.of(StandardAuthScheme.SPNEGO, StandardAuthScheme.KERBEROS, StandardAuthScheme.BEARER,
-                    StandardAuthScheme.DIGEST, StandardAuthScheme.BASIC);
+    private static final List<String> KERBEROS_PROXY_PREFERRED_AUTH_SCHEMES = Stream.concat(
+                    Stream.of(StandardAuthScheme.SPNEGO, StandardAuthScheme.KERBEROS),
+                    HC5Authentication.SCHEME_PRIORITY.stream())
+            .toList();
 
     private static final Oid SPNEGO_OID = createOid("1.3.6.1.5.5.2");
 
@@ -356,11 +363,27 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             requestConfig = RequestConfig.DEFAULT;
         }
         ClassicHttpResponse response = chain.proceed(request, scope);
+        countResponseBody(response, context);
         if (!requestConfig.isContentCompressionEnabled()) {
             return response;
         }
-        return decompressResponse(response, context);
+        return decompressResponse(response);
     };
+
+    /**
+     * Counts the response body as it is read off the connection, before it is decoded, so that the
+     * sample reports the size that was received, as HTTPHC4Impl does. The size of the body
+     * {@link HTTPSamplerBase#readResponse} keeps would be the size of the decoded body, of the
+     * truncated one, or of the MD5 digest of the body.
+     */
+    private static void countResponseBody(ClassicHttpResponse response, HttpContext context) {
+        HttpEntity entity = response.getEntity();
+        if (entity != null) {
+            CountingEntity countingEntity = new CountingEntity(entity);
+            response.setEntity(countingEntity);
+            context.setAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_COUNTER, countingEntity);
+        }
+    }
 
     /**
      * Decodes the response body while keeping the {@code Content-Encoding}, {@code Content-Length} and
@@ -369,7 +392,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      * and decodes the response itself for both the HTTP/1.1 and the HTTP/2 transport.
      */
     @SuppressWarnings("deprecation") // DecompressingEntity is superseded by the @Internal ContentCodecRegistry
-    private static ClassicHttpResponse decompressResponse(ClassicHttpResponse response, HttpContext context) {
+    private static ClassicHttpResponse decompressResponse(ClassicHttpResponse response) {
         HttpEntity entity = response.getEntity();
         if (entity == null || entity.getContentLength() == 0) {
             return response;
@@ -392,16 +415,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         }
         HeaderElement[] codecs = BasicHeaderValueParser.INSTANCE.parseElements(contentEncoding,
                 new ParserCursor(0, contentEncoding.length()));
-        CountingEntity countingEntity = new CountingEntity(entity);
-        boolean decompressing = false;
         for (HeaderElement codec : codecs) {
             InputStreamFactory decoderFactory = CONTENT_DECODERS.lookup(codec.getName().toLowerCase(Locale.ROOT));
             if (decoderFactory != null) {
-                if (!decompressing) {
-                    response.setEntity(countingEntity);
-                    context.setAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_COUNTER, countingEntity);
-                    decompressing = true;
-                }
                 response.setEntity(new DecompressingEntity(response.getEntity(), decoderFactory));
                 response.removeHeaders(HttpHeaders.CONTENT_LENGTH);
                 response.removeHeaders(HttpHeaders.CONTENT_ENCODING);
@@ -512,11 +528,17 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     protected HTTPSampleResult sample(URL url, String method, boolean areFollowingRedirect, int frameDepth) {
         HTTPSampleResult result = createSampleResult(url, method);
         org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request = null;
+        HttpClientContext context = null;
         ClassicHttpResponse response = null;
         try {
             resetStateIfNeeded();
             request = createRequest(url.toURI(), method);
             setupRequest(url, request, result, areFollowingRedirect);
+            // The client is set up before the sample starts, like HTTPHC4Impl does, so that the first
+            // sample of a thread, or of each iteration that starts as a new user, does not include
+            // building the client, its SSL context and, for HTTP/2, starting its I/O reactor
+            HttpClientKey clientKey = createHttpClientKey(url);
+            RequestExecutor executor = getRequestExecutor(clientKey);
             result.sampleStart();
 
             CacheManager cacheManager = getCacheManager();
@@ -528,10 +550,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
             interruptRequested = false;
             currentRequest = request;
-            HttpClientKey clientKey = createHttpClientKey(url);
-            HttpClientContext context = createHttpClientContext(url, clientKey, request);
+            context = createHttpClientContext(url, clientKey, request);
             context.setAttribute(CONTEXT_ATTRIBUTE_SAMPLER_RESULT, result);
-            response = executeRequest(url, clientKey, request, context);
+            response = executeRequest(url, clientKey, executor, request, context);
             readResponse(response, result, context);
             Long responseLatency = (Long) context.getAttribute(CONTEXT_ATTRIBUTE_RESPONSE_LATENCY);
             if (responseLatency != null) {
@@ -541,6 +562,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             currentRequest = null;
 
             updateResult(response, request, result);
+            HC5SentRequest.report(request, context, result);
             updateUrlAfterAutoRedirects(url, context, result);
             if (cacheManager != null) {
                 cacheManager.saveDetails(cacheResponseHeaders(response), result);
@@ -555,8 +577,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 result.sampleEnd();
             }
             if (request != null) {
-                result.setRequestHeaders(getRequestHeaders(request));
-                result.setSentBytes(calculateSentBytes(request));
+                HC5SentRequest.report(request, context, result);
             }
             return errorResult(e, result);
         } finally {
@@ -582,7 +603,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      * the proxy is covered by a Kerberos authorization, so that the auth scheme can use its
      * credentials.
      */
-    private ClassicHttpResponse executeRequest(URL url, HttpClientKey clientKey,
+    private ClassicHttpResponse executeRequest(URL url, HttpClientKey clientKey, RequestExecutor executor,
             org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context)
             throws IOException {
         Subject subject = getSubjectForUrl(url);
@@ -590,11 +611,11 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             subject = getSubjectForProxy(clientKey);
         }
         if (subject == null) {
-            return doExecuteRequest(clientKey, request, context);
+            return executor.execute(request, context);
         }
         try {
             return Subject.doAs(subject, (PrivilegedExceptionAction<ClassicHttpResponse>) () ->
-                    doExecuteRequest(clientKey, request, context));
+                    executor.execute(request, context));
         } catch (PrivilegedActionException e) {
             Exception cause = e.getException();
             if (cause instanceof IOException ioException) {
@@ -604,12 +625,41 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         }
     }
 
-    private ClassicHttpResponse doExecuteRequest(HttpClientKey clientKey,
-            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context)
-            throws IOException {
-        return clientKey.httpVersionPolicy != HttpVersionPolicy.FORCE_HTTP_1
-                ? executeHttp2(getHttp2Client(clientKey), request, context)
-                : getClient(clientKey).executeOpen(null, request, context);
+    /** Executes a request with a client that is already set up. */
+    @FunctionalInterface
+    private interface RequestExecutor {
+        ClassicHttpResponse execute(org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
+                HttpClientContext context) throws IOException;
+    }
+
+    /**
+     * Looks up the client for requests with the given key, the HTTP/2 one unless HTTP/1.1 is
+     * forced, and builds it if the thread has none yet.
+     */
+    private RequestExecutor getRequestExecutor(HttpClientKey clientKey) {
+        if (clientKey.httpVersionPolicy == HttpVersionPolicy.FORCE_HTTP_1) {
+            HC5ClassicClient client = getClient(clientKey);
+            client.allowConnectionsPerRoute(getParallelRequests());
+            return (request, context) -> client.client().executeOpen(null, request, context);
+        }
+        CloseableHttpAsyncClient client = getHttp2Client(clientKey);
+        return (request, context) -> executeHttp2(client, request, context);
+    }
+
+    /**
+     * Number of requests the sampler makes to a host at the same time, which is the number of
+     * parallel downloads of its embedded resources, if it downloads them in parallel.
+     */
+    private int getParallelRequests() {
+        if (!testElement.isConcurrentDwn()) {
+            return 1;
+        }
+        try {
+            return Integer.parseInt(testElement.getConcurrentPool());
+        } catch (NumberFormatException e) {
+            // the sampler falls back to the default as well
+            return HTTPSamplerBase.CONCURRENT_POOL_SIZE;
+        }
     }
 
     private void setupRequest(URL url, org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
@@ -617,7 +667,8 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         HttpVersionPolicy httpVersionPolicy = getHttpVersionPolicy(testElement.getHttpVersion(), DEFAULT_HTTP_VERSION,
                 url.getProtocol());
         RequestConfig.Builder config = RequestConfig.custom()
-                .setRedirectsEnabled(getAutoRedirects() && !areFollowingRedirect);
+                .setRedirectsEnabled(getAutoRedirects() && !areFollowingRedirect)
+                .setMaxRedirects(HTTPSamplerBase.MAX_REDIRECTS);
         int responseTimeout = getResponseTimeout();
         if (responseTimeout > 0) {
             config.setResponseTimeout(Timeout.ofMilliseconds(responseTimeout));
@@ -809,7 +860,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
      * @param message request or response
      * @return the headers of the message
      */
-    private static HeaderIterable headersOf(org.apache.hc.core5.http.MessageHeaders message) {
+    static HeaderIterable headersOf(org.apache.hc.core5.http.MessageHeaders message) {
         return action -> {
             for (Header header : message.getHeaders()) {
                 action.accept(header.getName(), header.getValue());
@@ -829,7 +880,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         HttpClientContext context = HttpClientContext.create();
         BasicCredentialsProvider credentialsProvider = new BasicCredentialsProvider();
         Authorization authorization = getAuthorizationForUrl(url);
-        configureTargetCredentials(url, request, credentialsProvider, authorization);
+        configureTargetCredentials(url, request, context, credentialsProvider, authorization);
         configureProxyCredentials(key, credentialsProvider);
         boolean kerberosTarget = isKerberos(authorization);
         boolean kerberosProxy = isKerberosProxy(key);
@@ -837,6 +888,10 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             configureKerberos(url, key, request, context, credentialsProvider, kerberosTarget, kerberosProxy);
         } else {
             context.setCredentialsProvider(credentialsProvider);
+        }
+        if (request.getConfig() == null || request.getConfig().isRedirectsEnabled()) {
+            AutoRedirectStrategy.attach(context, url, getCookieManager(), getAuthManager(), getHeaderManager(),
+                    credentialsProvider);
         }
         return context;
     }
@@ -878,17 +933,22 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     }
 
     private static void configureTargetCredentials(URL url,
-            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request,
+            org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context,
             BasicCredentialsProvider credentialsProvider, Authorization authorization) {
         if (authorization == null || isKerberos(authorization)) {
             // The credentials of a Kerberos authorization are used to log in to the KDC, they must
             // not be sent to the server
             return;
         }
-        credentialsProvider.setCredentials(new AuthScope(url.getHost(), getPort(url)),
-                new UsernamePasswordCredentials(authorization.getUser(), authorization.getPass().toCharArray()));
+        HC5Authentication.setTargetCredentials(credentialsProvider, url, authorization);
         if (AuthManager.Mechanism.BASIC.equals(authorization.getMechanism())) {
-            request.setHeader(HttpHeaders.AUTHORIZATION, authorization.toBasicHeader());
+            // The Authorization Manager takes precedence over an Authorization header of the Header
+            // Manager, which would also keep HttpClient from sending the credentials
+            request.removeHeaders(HttpHeaders.AUTHORIZATION);
+            String preemptiveAuthorization = HC5Authentication.preemptBasic(context, url, request, authorization);
+            if (preemptiveAuthorization != null) {
+                HC5SentRequest.rememberPreemptiveAuthorization(context, preemptiveAuthorization);
+            }
         }
     }
 
@@ -911,10 +971,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                         ? KerberosConfig.Option.ENABLE : KerberosConfig.Option.DEFAULT)
                 .build();
         DnsResolver dnsResolver = SystemDefaultDnsResolver.INSTANCE;
-        context.setAuthSchemeRegistry(RegistryBuilder.<AuthSchemeFactory>create()
-                .register(StandardAuthScheme.BASIC, BasicSchemeFactory.INSTANCE)
-                .register(StandardAuthScheme.DIGEST, DigestSchemeFactory.INSTANCE)
-                .register(StandardAuthScheme.BEARER, BearerSchemeFactory.INSTANCE)
+        context.setAuthSchemeRegistry(HC5Authentication.authSchemes()
                 .register(StandardAuthScheme.SPNEGO, new SPNegoSchemeFactory(kerberosConfig, dnsResolver))
                 .register(StandardAuthScheme.KERBEROS, new KerberosSchemeFactory(kerberosConfig, dnsResolver))
                 .build());
@@ -1024,13 +1081,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private static void configureProxyCredentials(HttpClientKey key, BasicCredentialsProvider credentialsProvider) {
         if (key.hasProxy && StringUtilities.isNotEmpty(key.proxyUser)) {
-            credentialsProvider.setCredentials(new AuthScope(key.proxyHost, key.proxyPort),
-                    new UsernamePasswordCredentials(key.proxyUser, key.proxyPass.toCharArray()));
+            HC5Authentication.setProxyCredentials(credentialsProvider, key.proxyHost, key.proxyPort, key.proxyUser,
+                    key.proxyPass);
         }
-    }
-
-    private static int getPort(URL url) {
-        return url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
     }
 
     private void readResponse(ClassicHttpResponse response, HTTPSampleResult result, HttpContext context)
@@ -1044,10 +1097,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         if (entity != null) {
             byte[] body = readResponse(result, entity.getContent(), entity.getContentLength());
             result.setResponseData(body);
-            // The HTTP/2 transport counts the body while it streams it, so a truncated response
-            // still reports the number of bytes the server actually sent. For HTTP/1.1 a compressed
-            // body is counted before it is decoded, so the reported size is the one that crossed the
-            // wire, like HTTPHC4Impl and HTTPJavaImpl report it
+            // Both transports count the body as they receive it, so the size that crossed the wire is
+            // reported, before the body is decoded, truncated or replaced by its MD5 digest, like
+            // HTTPHC4Impl reports it
             Long bodySize = (Long) context.getAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_SIZE);
             CountingEntity bodyCounter =
                     (CountingEntity) context.getAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_COUNTER);
@@ -1058,8 +1110,6 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
 
     private void updateResult(ClassicHttpResponse response,
             org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HTTPSampleResult result) {
-        result.setRequestHeaders(getRequestHeaders(request));
-        result.setSentBytes(calculateSentBytes(request));
         int statusCode = response.getCode();
         result.setResponseCode(Integer.toString(statusCode));
         result.setResponseMessage(response.getReasonPhrase());
@@ -1114,97 +1164,34 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return headers.toString();
     }
 
-    private static String getRequestHeaders(org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request) {
-        return formatHeaders(headersOf(request), ALL_EXCEPT_COOKIE);
-    }
-
-    private static long calculateSentBytes(org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request) {
-        if (request == null) {
-            return 0;
-        }
-        String uri = request.getRequestUri() != null ? request.getRequestUri() : "";
-        org.apache.hc.core5.http.ProtocolVersion version = request.getVersion();
-        String versionStr = version != null ? version.toString() : HTTPConstants.HTTP_VERSION_1_1;
-        long sentBytes = HTTPMessageSizes.requestLineLength(request.getMethod(), uri, versionStr);
-
-        for (Header header : request.getHeaders()) {
-            sentBytes += HTTPMessageSizes.headerLength(header.getName(), header.getValue());
-        }
-        sentBytes += implicitHeaderLength(request);
-        sentBytes += HTTPMessageSizes.EMPTY_LINE;
-
-        HttpEntity entity = request.getEntity();
-        if (entity != null) {
-            long contentLength = entity.getContentLength();
-            if (contentLength >= 0) {
-                sentBytes += contentLength;
-            } else if (entity.isRepeatable()) {
-                CountingOutputStream counter = new CountingOutputStream(OutputStream.nullOutputStream());
-                try {
-                    entity.writeTo(counter);
-                    sentBytes += counter.getBytesWritten();
-                } catch (IOException e) {
-                    log.debug("Exception measuring entity length", e);
-                }
-            }
-        }
-
-        return sentBytes;
-    }
-
-    /**
-     * Length of the headers the protocol layer adds when it writes the request, so that they are
-     * accounted for although they are not part of the request object JMeter built.
-     */
-    private static long implicitHeaderLength(org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request) {
-        long length = 0;
-        URIAuthority authority = request.getAuthority();
-        if (authority != null && !request.containsHeader(HttpHeaders.HOST)) {
-            length += HTTPMessageSizes.headerLength(HttpHeaders.HOST, authority.toString());
-        }
-        HttpEntity entity = request.getEntity();
-        if (entity == null) {
-            return length;
-        }
-        if (entity.getContentType() != null && !request.containsHeader(HttpHeaders.CONTENT_TYPE)) {
-            length += HTTPMessageSizes.headerLength(HttpHeaders.CONTENT_TYPE, entity.getContentType());
-        }
-        if (entity.getContentEncoding() != null && !request.containsHeader(HttpHeaders.CONTENT_ENCODING)) {
-            length += HTTPMessageSizes.headerLength(HttpHeaders.CONTENT_ENCODING, entity.getContentEncoding());
-        }
-        if (request.containsHeader(HttpHeaders.CONTENT_LENGTH) || request.containsHeader(HttpHeaders.TRANSFER_ENCODING)) {
-            return length;
-        }
-        long contentLength = entity.getContentLength();
-        if (contentLength >= 0) {
-            length += HTTPMessageSizes.headerLength(HttpHeaders.CONTENT_LENGTH, Long.toString(contentLength));
-        } else if (entity.isChunked()) {
-            length += HTTPMessageSizes.headerLength(HttpHeaders.TRANSFER_ENCODING, "chunked");
-        }
-        return length;
-    }
-
     private static void saveConnectionCookies(ClassicHttpResponse response, URL url, CookieManager cookieManager) {
         saveConnectionCookies(headersOf(response), url, cookieManager);
     }
 
-    private static CloseableHttpClient getClient(HttpClientKey key) {
-        Map<HttpClientKey, CloseableHttpClient> clients =
-                HTTP_CLIENTS.computeIfAbsent(JMeterContextService.getContext(), context -> new ConcurrentHashMap<>());
+    private static HC5ClassicClient getClient(HttpClientKey key) {
+        Map<HttpClientKey, HC5ClassicClient> clients =
+                clientsOfCurrentThread(JMeterContextService.getContext(), THREAD_STATE_CLIENTS);
         return clients.computeIfAbsent(key, HTTPHC5Impl::createClient);
     }
 
     private static CloseableHttpAsyncClient getHttp2Client(HttpClientKey key) {
+        JMeterContext jmeterContext = JMeterContextService.getContext();
         Map<HttpClientKey, CloseableHttpAsyncClient> clients =
-                HTTP_2_CLIENTS.computeIfAbsent(JMeterContextService.getContext(), context -> new ConcurrentHashMap<>());
-        return clients.computeIfAbsent(key, HTTPHC5Impl::createHttp2Client);
+                clientsOfCurrentThread(jmeterContext, THREAD_STATE_HTTP_2_CLIENTS);
+        return clients.computeIfAbsent(key.forAnyOrigin(), k -> createHttp2Client(k, jmeterContext));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <C> Map<HttpClientKey, C> clientsOfCurrentThread(JMeterContext jmeterContext, String name) {
+        return (Map<HttpClientKey, C>) jmeterContext.getThreadState()
+                .computeIfAbsent(name, n -> new ConcurrentHashMap<HttpClientKey, C>());
     }
 
     private static boolean isDefaultUserAgentDisabled() {
         return JMeterUtils.getPropDefault(DISABLE_DEFAULT_UA_PROPERTY, false);
     }
 
-    private static CloseableHttpClient createClient(HttpClientKey key) {
+    private static HC5ClassicClient createClient(HttpClientKey key) {
         org.apache.hc.client5.http.impl.classic.HttpClientBuilder builder = HttpClients.custom().disableAutomaticRetries();
         if (isDefaultUserAgentDisabled()) {
             builder.disableDefaultUserAgent();
@@ -1223,14 +1210,21 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             connectionConfig.setConnectTimeout(Timeout.ofMilliseconds(key.connectTimeout));
         }
         connectionManagerBuilder.setDefaultConnectionConfig(connectionConfig.build());
-        builder.setConnectionManager(new ConnectTimeMeasuringConnectionManager(connectionManagerBuilder.build()));
+        PoolingHttpClientConnectionManager pool = connectionManagerBuilder.build();
+        builder.setConnectionManager(new ConnectTimeMeasuringConnectionManager(pool));
         builder.setRoutePlanner(createRoutePlanner(key));
-        return builder.disableContentCompression()
+        return new HC5ClassicClient(builder.disableContentCompression()
+                // Cookies are left to the Cookie Manager, see AutoRedirectStrategy for those of redirects
+                .disableCookieManagement()
+                .setRedirectStrategy(AutoRedirectStrategy.INSTANCE)
+                .setDefaultAuthSchemeRegistry(HC5Authentication.authSchemes().build())
+                .setTargetAuthenticationStrategy(HC5Authentication.STRATEGY)
+                .setProxyAuthenticationStrategy(HC5Authentication.STRATEGY)
                 .addExecInterceptorFirst("response-content-encoding", RESPONSE_CONTENT_ENCODING)
-                .build();
+                .build(), pool);
     }
 
-    private static CloseableHttpAsyncClient createHttp2Client(HttpClientKey key) {
+    private static CloseableHttpAsyncClient createHttp2Client(HttpClientKey key, JMeterContext jmeterContext) {
         HttpAsyncClientBuilder builder = HttpAsyncClients.custom()
                 .disableAutomaticRetries()
                 // HttpClient 5.6 added transparent content compression to the async transport. JMeter decodes
@@ -1238,7 +1232,19 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 // does not depend on the optional codec libraries HttpClient detects on the classpath.
                 .disableContentCompression()
                 .setH2Config(HTTP_2_CONFIG)
-                .setRoutePlanner(createRoutePlanner(key));
+                .setRoutePlanner(createRoutePlanner(key))
+                // Cookies are left to the Cookie Manager, see AutoRedirectStrategy for those of redirects
+                .disableCookieManagement()
+                .setRedirectStrategy(AutoRedirectStrategy.INSTANCE)
+                .setDefaultAuthSchemeRegistry(HC5Authentication.authSchemes().build())
+                .setTargetAuthenticationStrategy(HC5Authentication.STRATEGY)
+                .setProxyAuthenticationStrategy(HC5Authentication.STRATEGY)
+                // A JMeter thread only has a few requests in flight, which a single I/O thread serves
+                // easily, whereas HttpClient would start one per processor for every client. Work done on
+                // it, like TLS handshakes, auth challenges or AutoRedirectStrategy, holds up the others.
+                .setIOReactorConfig(IOReactorConfig.custom().setIoThreadCount(1).build())
+                .setThreadFactory(threadsSharingContext(jmeterContext));
+        AsyncResponseTimeout.install(builder);
         if (HTTP_2_MULTIPLEXING) {
             // A connection bound to a user token cannot be shared, and HTTP/2 has no connection scoped state anyway
             builder.disableConnectionState();
@@ -1277,9 +1283,28 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         return asyncClient;
     }
 
+    /**
+     * Creates the threads of an HTTP/2 client with the {@link JMeterContext} of the JMeter thread the
+     * client belongs to, like the threads which download embedded resources in parallel. They run
+     * the TLS handshakes, in which the key manager of the JMeter key store picks the client
+     * certificate, by the alias variable of the Keystore Configuration among others, so they have to
+     * see the variables of that thread rather than those of a context of their own. They are named
+     * after that thread, so a thread dump tells which JMeter thread they work for.
+     */
+    private static ThreadFactory threadsSharingContext(JMeterContext jmeterContext) {
+        JMeterThread jmeterThread = jmeterContext.getThread();
+        String owner = jmeterThread != null ? jmeterThread.getThreadName() : Thread.currentThread().getName();
+        ThreadFactory threadFactory = new DefaultThreadFactory(owner + " httpclient5", true);
+        return runnable -> threadFactory.newThread(() -> {
+            JMeterContextService.replaceContext(jmeterContext);
+            runnable.run();
+        });
+    }
+
     private ClassicHttpResponse executeHttp2(CloseableHttpAsyncClient client,
             org.apache.hc.client5.http.classic.methods.HttpUriRequestBase request, HttpClientContext context)
             throws IOException {
+        AsyncResponseTimeout responseTimeout = AsyncResponseTimeout.attach(request.getConfig(), context);
         RequestBody requestBody = createRequestBody(request);
         try {
             Future<ClassicHttpResponse> responseFuture = client.execute(requestBody.producer,
@@ -1292,13 +1317,19 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
                 responseFuture.cancel(true);
             }
             try {
-                return responseFuture.get();
+                return responseTimeout.await(responseFuture);
             } catch (InterruptedException e) {
                 responseFuture.cancel(true);
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while executing HTTP/2 request", e);
             } catch (ExecutionException e) {
-                throw new IOException("Could not execute HTTP/2 request", e.getCause());
+                Throwable cause = e.getCause();
+                if (cause instanceof SocketTimeoutException timeout) {
+                    // A timeout HttpClient detected itself, like the response timeout it applies when
+                    // HTTP/1.1 was negotiated, so the sample reports it like the HTTP/1.1 transport does
+                    throw timeout;
+                }
+                throw new IOException("Could not execute HTTP/2 request", cause);
             } finally {
                 currentResponseFuture = null;
             }
@@ -1310,9 +1341,9 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
     }
 
     /**
-     * Number of response body bytes worth keeping, {@code 0} meaning all of them. This has to be
-     * determined on the sampler thread, as the recording flag lives in a thread local the HTTP/2
-     * I/O reactor threads do not see. Truncation is also given up when an MD5 digest is requested,
+     * Number of response body bytes worth keeping, {@code 0} meaning all of them, which is
+     * determined on the sampler thread when the request is executed and handed to the response
+     * consumer. Truncation is given up while recording, and when an MD5 digest is requested,
      * because that is computed over the whole body.
      */
     private long getMaxBytesToStore() {
@@ -1491,7 +1522,7 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             }
             // The body may have been truncated, so report what the server actually sent
             context.setAttribute(CONTEXT_ATTRIBUTE_RESPONSE_BODY_SIZE, totalBodyBytes);
-            return decompressResponse(response, context);
+            return decompressResponse(response);
         }
 
         @Override
@@ -1648,12 +1679,14 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
         // Only the clients of this JMeter thread are dropped. The threads which download embedded
         // resources borrow them while they work for this thread, and they are done by the time the
         // sample returns, so no client is closed while a request is still using it.
-        JMeterContext context = JMeterContextService.getContext();
-        closeQuietly(HTTP_CLIENTS.remove(context));
-        closeQuietly(HTTP_2_CLIENTS.remove(context));
+        Map<String, Object> threadState = JMeterContextService.getContext().getThreadState();
+        closeQuietly(threadState.remove(THREAD_STATE_CLIENTS));
+        closeQuietly(threadState.remove(THREAD_STATE_HTTP_2_CLIENTS));
     }
 
-    private static void closeQuietly(Map<HttpClientKey, ? extends Closeable> clients) {
+    @SuppressWarnings("unchecked")
+    private static void closeQuietly(Object threadStateClients) {
+        Map<HttpClientKey, ? extends Closeable> clients = (Map<HttpClientKey, ? extends Closeable>) threadStateClients;
         if (clients == null) {
             return;
         }
@@ -1840,6 +1873,16 @@ public class HTTPHC5Impl extends HTTPHCAbstractImpl {
             this.dnsCacheManager = dnsCacheManager;
             this.localAddress = localAddress;
             this.httpVersionPolicy = httpVersionPolicy;
+        }
+
+        /**
+         * Key of the HTTP/2 client, which serves every origin, as its pool keeps the connections per
+         * route and nothing else about it depends on the origin. So a JMeter thread usually has a
+         * single HTTP/2 client, and with it a single I/O reactor, whatever the hosts it samples.
+         */
+        HttpClientKey forAnyOrigin() {
+            return new HttpClientKey(null, null, hasProxy, proxyScheme, proxyHost, proxyPort, proxyUser, proxyPass,
+                    connectTimeout, dnsCacheManager, localAddress, httpVersionPolicy);
         }
 
         @Override

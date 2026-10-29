@@ -124,7 +124,7 @@ final class ConnectTimeTracker {
         /** Set to {@code null} once the connection has been established, which also releases the samples. */
         private final AtomicReference<List<PendingSample>> waitingSamples;
 
-        Connection(List<PendingSample> waitingSamples) {
+        private Connection(List<PendingSample> waitingSamples) {
             this.waitingSamples = new AtomicReference<>(waitingSamples);
         }
 
